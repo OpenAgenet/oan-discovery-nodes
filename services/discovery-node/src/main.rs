@@ -71,6 +71,8 @@ struct DiscoveryNotificationItem {
     resource_type: Option<String>,
     #[serde(rename = "capabilityTags", default)]
     capability_tags: Vec<String>,
+    #[serde(rename = "authorizedDomains", default)]
+    authorized_domains: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1249,6 +1251,8 @@ async fn sync_resources_from_cdn_items(
     let mut fetched_count = 0usize;
     let mut cursor = start_cursor;
     let mut blocked_cursor: Option<i64> = None;
+    let discovery_domains =
+        local_discovery_authorized_domains(&state).map_err(ApiError::internal)?;
 
     let mut items = request.items;
     items.sort_by_key(|item| item.publication_cursor);
@@ -1303,6 +1307,15 @@ async fn sync_resources_from_cdn_items(
                 "resourceDid": item.resource_did,
                 "cursor": item.publication_cursor,
                 "reason": reason
+            }));
+            blocked_cursor = Some(item.publication_cursor);
+            continue;
+        }
+        if !authorized_domains_cover(&discovery_domains, &package.metadata.authorized_domains) {
+            rejected.push(json!({
+                "resourceDid": package.resource_did,
+                "cursor": item.publication_cursor,
+                "reason": "unauthorized_domains"
             }));
             blocked_cursor = Some(item.publication_cursor);
             continue;
@@ -1465,6 +1478,13 @@ fn validate_notified_resource_package(
     {
         return Err("capability_tags_mismatch".to_owned());
     }
+    if item.authorized_domains.is_empty() {
+        return Err("resource_domains_required".to_owned());
+    }
+    validate_authorized_domain_list(&item.authorized_domains)?;
+    if package.metadata.authorized_domains != item.authorized_domains {
+        return Err("authorized_domains_mismatch".to_owned());
+    }
     Ok(())
 }
 
@@ -1554,6 +1574,13 @@ async fn keyword_discovery_candidates(
     query: &ResourceDiscoveryQuery,
 ) -> Result<(Vec<ResourceDiscoveryCandidate>, usize, bool)> {
     let (packages, prefiltered) = query_indexed_resource_packages(state, query).await?;
+    let allowed_domains = local_discovery_authorized_domains(state)?;
+    let packages = packages
+        .into_iter()
+        .filter(|package| {
+            authorized_domains_cover(&allowed_domains, &package.metadata.authorized_domains)
+        })
+        .collect::<Vec<_>>();
     let candidate_count = packages.len();
     let candidates = packages
         .into_iter()
@@ -1577,6 +1604,7 @@ fn discovery_candidate_from_package(
         version: Some(package.package_version.clone()),
         lifecycle_state: Some(package.metadata.lifecycle_state.clone()),
         capability_tags: package.metadata.capability_tags.clone(),
+        authorized_domains: package.metadata.authorized_domains.clone(),
         services: package.metadata.services.clone(),
         protocol_bindings: package.metadata.protocol_bindings.clone(),
         package_info: package
@@ -2467,11 +2495,11 @@ async fn query_indexed_resource_packages(
             .into_iter()
             .map(|row| serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(0)))
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        return Ok((packages, true));
+        return Ok((filter_packages_for_local_discovery(state, packages)?, true));
     }
     read_indexed_resource_packages(state)
         .await
-        .map(|packages| (packages, false))
+        .and_then(|packages| Ok((filter_packages_for_local_discovery(state, packages)?, false)))
 }
 
 async fn query_semantic_index(
@@ -2578,9 +2606,85 @@ async fn query_pgvector_semantic_index(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let allowed_domains = local_discovery_authorized_domains(state)?;
+    hits.retain(|hit| {
+        authorized_domains_cover(&allowed_domains, &hit.package.metadata.authorized_domains)
+    });
     hits.sort_by(|a, b| b.final_score.total_cmp(&a.final_score));
     hits.truncate(query.limit as usize);
     Ok(Some(hits))
+}
+
+fn filter_packages_for_local_discovery(
+    state: &AppState,
+    packages: Vec<ResourcePackage>,
+) -> Result<Vec<ResourcePackage>> {
+    let allowed_domains = local_discovery_authorized_domains(state)?;
+    Ok(packages
+        .into_iter()
+        .filter(|package| {
+            authorized_domains_cover(&allowed_domains, &package.metadata.authorized_domains)
+        })
+        .collect())
+}
+
+fn local_discovery_authorized_domains(state: &AppState) -> Result<Vec<String>> {
+    let document: DidDocument = state.data.read("did-document.json")?;
+    let domains = document
+        .oan_metadata
+        .as_ref()
+        .map(|metadata| metadata.authorized_domains.clone())
+        .unwrap_or_default();
+    validate_authorized_domain_list(&domains).map_err(anyhow::Error::msg)?;
+    Ok(domains)
+}
+
+fn validate_authorized_domain_list(domains: &[String]) -> std::result::Result<(), String> {
+    if domains.iter().any(|domain| domain == "*") {
+        return if domains.len() == 1 {
+            Ok(())
+        } else {
+            Err("invalid_authorized_domains".to_owned())
+        };
+    }
+    for domain in domains {
+        if domain.trim().is_empty()
+            || domain != domain.trim()
+            || domain.contains("..")
+            || domain.starts_with('.')
+            || domain.ends_with('.')
+        {
+            return Err("invalid_authorized_domains".to_owned());
+        }
+    }
+    if domains.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err("invalid_authorized_domains".to_owned());
+    }
+    Ok(())
+}
+
+fn authorized_domain_covers(granted: &str, requested: &str) -> bool {
+    granted == requested
+        || requested
+            .strip_prefix(granted)
+            .is_some_and(|suffix| suffix.starts_with('.'))
+}
+
+fn authorized_domains_cover(granted: &[String], requested: &[String]) -> bool {
+    if requested.is_empty() {
+        return false;
+    }
+    if granted.iter().any(|domain| domain == "*") {
+        return true;
+    }
+    if granted.is_empty() {
+        return false;
+    }
+    requested.iter().all(|requested_domain| {
+        granted
+            .iter()
+            .any(|granted_domain| authorized_domain_covers(granted_domain, requested_domain))
+    })
 }
 
 fn semantic_candidate_limit(query_limit: u32, config: &SemanticSearchConfig) -> i64 {
@@ -2872,6 +2976,10 @@ fn validate_resource_package_for_index(
     if package.metadata.lifecycle_state != "active" {
         return Err("resource_not_active".to_owned());
     }
+    if package.metadata.authorized_domains.is_empty() {
+        return Err("resource_domains_required".to_owned());
+    }
+    validate_authorized_domain_list(&package.metadata.authorized_domains)?;
     Ok(())
 }
 
@@ -2978,6 +3086,6 @@ fn discovery_authorized_domains(bulletin: &Value, discovery_did: &str) -> Vec<St
                 .filter_map(|value| value.as_str().map(ToOwned::to_owned))
                 .collect()
         })
-        .unwrap_or_else(|| vec!["*".to_owned()])
+        .unwrap_or_default()
 }
 
