@@ -1499,6 +1499,28 @@ async fn resource_query(
     Json(query): Json<ResourceDiscoveryQuery>,
 ) -> ApiResult<ResourceDiscoveryResponse> {
     let started = Instant::now();
+    if let Some(resource_did) = query_resource_did(&query) {
+        let package = read_indexed_resource_package(&state, resource_did)
+            .await
+            .map_err(ApiError::internal)?;
+        let candidates = package
+            .filter(|package| resource_matches_exact_did_query(package, &query))
+            .map(|package| discovery_candidate_from_package(package, 1.0))
+            .into_iter()
+            .collect::<Vec<_>>();
+        println!(
+            "discovery_query backend=exact-did indexed=true candidates={} returned={} elapsed_ms={}",
+            candidates.len(),
+            candidates.len(),
+            started.elapsed().as_millis()
+        );
+        return Ok(Json(ResourceDiscoveryResponse {
+            discovery_did: state.did,
+            candidates,
+            created_at: Utc::now(),
+            proof: None,
+        }));
+    }
     let semantic_result = query_semantic_index(&state, &query).await;
     let (mut candidates, candidate_count, prefiltered, backend) = match semantic_result {
         Ok(Some(hits)) if !hits.is_empty() => {
@@ -1573,6 +1595,15 @@ async fn resource_query(
         created_at: Utc::now(),
         proof: None,
     }))
+}
+
+fn query_resource_did(query: &ResourceDiscoveryQuery) -> Option<&str> {
+    let value = query.query.as_ref()?.trim();
+    if value.starts_with("did:oan:") && !value.chars().any(char::is_whitespace) {
+        Some(value)
+    } else {
+        None
+    }
 }
 
 async fn keyword_discovery_candidates(
@@ -3065,6 +3096,15 @@ fn resource_matches_query(package: &ResourcePackage, query: &ResourceDiscoveryQu
         return haystack.contains(&needle);
     }
     true
+}
+
+fn resource_matches_exact_did_query(
+    package: &ResourcePackage,
+    query: &ResourceDiscoveryQuery,
+) -> bool {
+    let mut query_without_text = query.clone();
+    query_without_text.query = None;
+    resource_matches_query(package, &query_without_text)
 }
 
 fn resource_score(package: &ResourcePackage, query: &ResourceDiscoveryQuery) -> f32 {
