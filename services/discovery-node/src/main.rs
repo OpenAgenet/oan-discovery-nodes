@@ -1129,7 +1129,7 @@ fn normalize_vector(mut vector: Vec<f32>) -> Vec<f32> {
 
 fn pgvector_literal(vector: &[f32]) -> String {
     format!(
-        "[{}]",
+        "'[{}]'",
         vector
             .iter()
             .map(|value| format!("{value:.8}"))
