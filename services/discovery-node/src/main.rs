@@ -60,14 +60,20 @@ struct DiscoverySyncRequest {
 struct DiscoveryNotificationItem {
     #[serde(rename = "resourceDid")]
     resource_did: String,
+    // Kept in the notification contract for audit/compatibility. The discovery
+    // node indexes the current CDN package and validates the package itself.
+    #[allow(dead_code)]
     #[serde(rename = "packageVersion")]
     package_version: String,
     #[serde(rename = "publicationCursor")]
     publication_cursor: i64,
+    #[allow(dead_code)]
     #[serde(rename = "packageHash")]
     package_hash: String,
+    #[allow(dead_code)]
     #[serde(rename = "metadataHash")]
     metadata_hash: String,
+    #[allow(dead_code)]
     #[serde(rename = "didDocumentHash")]
     did_document_hash: String,
     #[serde(rename = "resourceType", default)]
@@ -1278,10 +1284,8 @@ async fn sync_resources_from_cdn_items(
         if item.publication_cursor > target_cursor {
             break;
         }
-        if blocked_cursor.is_some() {
-            break;
-        }
         fetched_count += 1;
+        cursor = cursor.max(item.publication_cursor);
         let package = if let Some(package) = batch_packages.get(&item.resource_did) {
             package.clone()
         } else {
@@ -1293,7 +1297,7 @@ async fn sync_resources_from_cdn_items(
                         "cursor": item.publication_cursor,
                         "reason": "resource_package_unavailable"
                     }));
-                    blocked_cursor = Some(item.publication_cursor);
+                    blocked_cursor.get_or_insert(item.publication_cursor);
                     continue;
                 }
                 Err(err) => return Err(ApiError::internal(err)),
@@ -1305,7 +1309,7 @@ async fn sync_resources_from_cdn_items(
                 "cursor": item.publication_cursor,
                 "reason": "resource_did_mismatch"
             }));
-            blocked_cursor = Some(item.publication_cursor);
+            blocked_cursor.get_or_insert(item.publication_cursor);
             continue;
         }
         if let Err(reason) = validate_notified_resource_package(&item, &package) {
@@ -1314,7 +1318,7 @@ async fn sync_resources_from_cdn_items(
                 "cursor": item.publication_cursor,
                 "reason": reason
             }));
-            blocked_cursor = Some(item.publication_cursor);
+            blocked_cursor.get_or_insert(item.publication_cursor);
             continue;
         }
         if !authorized_domains_cover(&discovery_domains, &package.metadata.authorized_domains) {
@@ -1323,7 +1327,7 @@ async fn sync_resources_from_cdn_items(
                 "cursor": item.publication_cursor,
                 "reason": "unauthorized_domains"
             }));
-            blocked_cursor = Some(item.publication_cursor);
+            blocked_cursor.get_or_insert(item.publication_cursor);
             continue;
         }
         if let Err(reason) = validate_resource_package_for_index(&package) {
@@ -1332,10 +1336,9 @@ async fn sync_resources_from_cdn_items(
                 "cursor": item.publication_cursor,
                 "reason": reason
             }));
-            blocked_cursor = Some(item.publication_cursor);
+            blocked_cursor.get_or_insert(item.publication_cursor);
             continue;
         }
-        cursor = cursor.max(item.publication_cursor);
         accepted.push((item.publication_cursor, package));
     }
 
@@ -1458,18 +1461,6 @@ fn validate_notified_resource_package(
 ) -> std::result::Result<(), String> {
     if package.resource_did != item.resource_did {
         return Err("resource_did_mismatch".to_owned());
-    }
-    if package.package_version != item.package_version {
-        return Err("package_version_mismatch".to_owned());
-    }
-    if package.package_hash != item.package_hash {
-        return Err("package_hash_mismatch".to_owned());
-    }
-    if package.metadata_hash != item.metadata_hash {
-        return Err("metadata_hash_mismatch".to_owned());
-    }
-    if package.did_document_hash != item.did_document_hash {
-        return Err("did_document_hash_mismatch".to_owned());
     }
     if let Some(resource_type) = item.resource_type.as_deref() {
         let package_resource_type = serde_json::to_value(&package.resource_type)
@@ -2083,6 +2074,7 @@ async fn upsert_indexed_resource_packages_batch(
     if packages.is_empty() {
         return Ok(());
     }
+    let packages = latest_resource_packages_by_did(packages);
     let updated_at = Utc::now();
     let updated_at_text = updated_at.to_rfc3339();
     if let Some(sqlite) = &state.sqlite {
@@ -2196,6 +2188,23 @@ async fn upsert_indexed_resource_packages_batch(
     }
     state.index.write("resource-capabilities.json", &indexed)?;
     Ok(())
+}
+
+fn latest_resource_packages_by_did(
+    packages: &[(i64, ResourcePackage)],
+) -> Vec<(i64, ResourcePackage)> {
+    let mut latest = BTreeMap::<String, (i64, ResourcePackage)>::new();
+    for (cursor, package) in packages {
+        latest
+            .entry(package.resource_did.clone())
+            .and_modify(|existing| {
+                if *cursor >= existing.0 {
+                    *existing = (*cursor, package.clone());
+                }
+            })
+            .or_insert_with(|| (*cursor, package.clone()));
+    }
+    latest.into_values().collect()
 }
 
 async fn upsert_semantic_index_batch(
@@ -3102,9 +3111,10 @@ fn resource_matches_exact_did_query(
     package: &ResourcePackage,
     query: &ResourceDiscoveryQuery,
 ) -> bool {
-    let mut query_without_text = query.clone();
-    query_without_text.query = None;
-    resource_matches_query(package, &query_without_text)
+    query
+        .version
+        .as_ref()
+        .map_or(true, |version| version == &package.package_version)
 }
 
 fn resource_score(package: &ResourcePackage, query: &ResourceDiscoveryQuery) -> f32 {
