@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{Postgres, QueryBuilder, Row, Sqlite};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -91,6 +91,14 @@ struct DiscoveryNotificationItem {
     capability_tags: Vec<String>,
     #[serde(rename = "authorizedDomains", default)]
     authorized_domains: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct RejectedPackageBackfillRequest {
+    #[serde(rename = "maxItems", default)]
+    max_items: Option<usize>,
+    #[serde(rename = "resourceDids", default)]
+    resource_dids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -651,7 +659,10 @@ struct SemanticEvaluationSeedResource {
     use_case_examples: Vec<String>,
     #[serde(default)]
     examples: Vec<Value>,
-    #[serde(default = "default_semantic_evaluation_package_version", rename = "packageVersion")]
+    #[serde(
+        default = "default_semantic_evaluation_package_version",
+        rename = "packageVersion"
+    )]
     package_version: String,
 }
 
@@ -829,6 +840,10 @@ async fn main() -> Result<()> {
         .route("/discovery/query/suggestions", post(api_query_suggestions))
         .route("/discovery/query/explain", post(api_query_explain))
         .route("/discovery/rejected-packages", get(api_rejected_packages))
+        .route(
+            "/discovery/rejected-packages/backfill",
+            post(api_backfill_rejected_packages),
+        )
         .route("/discovery/capability-tree", get(api_capability_tree))
         .layer(build_cors_layer(&config.cors)?)
         .with_state(state.clone());
@@ -2943,6 +2958,130 @@ async fn api_rejected_packages(State(state): State<AppState>) -> ApiResult<Value
     Ok(Json(json!({ "items": items, "count": items.len() })))
 }
 
+async fn api_backfill_rejected_packages(
+    State(state): State<AppState>,
+    Json(request): Json<RejectedPackageBackfillRequest>,
+) -> ApiResult<Value> {
+    let _sync_guard = state.resource_sync_lock.lock().await;
+    let cdn_base = state
+        .config
+        .upstream
+        .cdn_endpoint
+        .clone()
+        .unwrap_or_else(|| state.config.upstream.root_endpoint.clone())
+        .trim_end_matches('/')
+        .to_owned();
+    backfill_rejected_resource_packages(&state, &cdn_base, request)
+        .await
+        .map(Json)
+        .map_err(ApiError::internal)
+}
+
+async fn backfill_rejected_resource_packages(
+    state: &AppState,
+    cdn_base: &str,
+    request: RejectedPackageBackfillRequest,
+) -> Result<Value> {
+    let max_items = request.max_items.unwrap_or(100).max(1);
+    let requested_dids = request.resource_dids.into_iter().collect::<BTreeSet<_>>();
+    let discovery_domains = local_discovery_authorized_domains(state)?;
+    let rejected = read_rejected_packages(state).await?;
+    let mut attempted = 0usize;
+    let mut recovered = Vec::<Value>::new();
+    let mut failed = Vec::<Value>::new();
+    let mut skipped = 0usize;
+    let mut accepted = Vec::<(i64, ResourcePackage)>::new();
+    let mut resolved_reject_keys = Vec::<String>::new();
+    let mut replacement_rejections = Vec::<Value>::new();
+
+    for item in rejected.iter() {
+        let reason = item
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let resource_did = item
+            .get("resourceDid")
+            .or_else(|| item.get("did"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if reason != "resource_package_unavailable"
+            || resource_did.is_empty()
+            || (!requested_dids.is_empty() && !requested_dids.contains(resource_did))
+        {
+            skipped += 1;
+            continue;
+        }
+        if attempted >= max_items {
+            skipped += 1;
+            continue;
+        }
+        attempted += 1;
+        let cursor = item
+            .get("cursor")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        match fetch_cdn_resource_package(state, cdn_base, resource_did).await {
+            Ok(Some(package)) => {
+                let reject_reason = if package.resource_did != resource_did {
+                    Some("resource_did_mismatch".to_owned())
+                } else if !authorized_domains_cover(
+                    &discovery_domains,
+                    &package.metadata.authorized_domains,
+                ) {
+                    Some("unauthorized_domains".to_owned())
+                } else {
+                    validate_resource_package_for_index(&package).err()
+                };
+                if let Some(reason) = reject_reason {
+                    let replacement = json!({
+                        "resourceDid": resource_did,
+                        "cursor": cursor,
+                        "reason": reason
+                    });
+                    failed.push(replacement.clone());
+                    replacement_rejections.push(replacement);
+                    resolved_reject_keys.push(rejected_package_key(item));
+                    continue;
+                }
+                recovered.push(json!({
+                    "resourceDid": resource_did,
+                    "cursor": cursor
+                }));
+                resolved_reject_keys.push(rejected_package_key(item));
+                accepted.push((cursor, package));
+            }
+            Ok(None) => failed.push(json!({
+                "resourceDid": resource_did,
+                "cursor": cursor,
+                "reason": "resource_package_unavailable"
+            })),
+            Err(err) => failed.push(json!({
+                "resourceDid": resource_did,
+                "cursor": cursor,
+                "reason": "cdn_fetch_failed",
+                "error": err.to_string()
+            })),
+        }
+    }
+
+    upsert_indexed_resource_packages_batch(state, &accepted).await?;
+    delete_rejected_packages(state, &resolved_reject_keys).await?;
+    write_rejected_packages(state, &replacement_rejections).await?;
+    let remaining_rejected_count = read_rejected_packages(state).await?.len();
+
+    Ok(json!({
+        "status": "backfilled",
+        "reason": "resource_package_unavailable",
+        "attemptedCount": attempted,
+        "recoveredCount": recovered.len(),
+        "skippedCount": skipped,
+        "failedCount": failed.len(),
+        "remainingRejectedCount": remaining_rejected_count,
+        "recovered": recovered,
+        "failed": failed
+    }))
+}
+
 async fn api_capability_tree(State(state): State<AppState>) -> ApiResult<Value> {
     let response = state
         .client
@@ -4111,10 +4250,12 @@ async fn seed_semantic_evaluation_packages(state: &AppState, suite_path: &Path) 
 
 fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<ResourcePackage> {
     let did = seed.resource_did.clone();
-    let service_endpoint = seed
-        .service_endpoint
-        .clone()
-        .unwrap_or_else(|| format!("https://example.org/oan/resources/{}", did.replace(':', "/")));
+    let service_endpoint = seed.service_endpoint.clone().unwrap_or_else(|| {
+        format!(
+            "https://example.org/oan/resources/{}",
+            did.replace(':', "/")
+        )
+    });
     let protocol = seed
         .protocols
         .first()
@@ -4388,14 +4529,7 @@ async fn write_rejected_packages(state: &AppState, rejected: &[Value]) -> Result
         let now = Utc::now().to_rfc3339();
         let mut tx = sqlite.pool().begin().await?;
         for item in rejected {
-            let reject_key = format!(
-                "{}:{}",
-                item["resourceDid"]
-                    .as_str()
-                    .or_else(|| item["did"].as_str())
-                    .unwrap_or("unknown"),
-                item["cursor"].as_i64().unwrap_or_default()
-            );
+            let reject_key = rejected_package_key(item);
             sqlx::query(&format!(
                 r#"
                 INSERT INTO {DISCOVERY_REJECTED_TABLE}(reject_key, item_json, updated_at)
@@ -4417,14 +4551,7 @@ async fn write_rejected_packages(state: &AppState, rejected: &[Value]) -> Result
         let now = Utc::now();
         let mut tx = postgres.pool().begin().await?;
         for item in rejected {
-            let reject_key = format!(
-                "{}:{}",
-                item["resourceDid"]
-                    .as_str()
-                    .or_else(|| item["did"].as_str())
-                    .unwrap_or("unknown"),
-                item["cursor"].as_i64().unwrap_or_default()
-            );
+            let reject_key = rejected_package_key(item);
             sqlx::query(&format!(
                 r#"
                 INSERT INTO {DISCOVERY_REJECTED_TABLE}(reject_key, item_json, updated_at)
@@ -4442,6 +4569,57 @@ async fn write_rejected_packages(state: &AppState, rejected: &[Value]) -> Result
         tx.commit().await?;
         return Ok(());
     }
+    state.index.write("rejected-packages.json", &rejected)?;
+    Ok(())
+}
+
+fn rejected_package_key(item: &Value) -> String {
+    format!(
+        "{}:{}",
+        item["resourceDid"]
+            .as_str()
+            .or_else(|| item["did"].as_str())
+            .unwrap_or("unknown"),
+        item["cursor"].as_i64().unwrap_or_default()
+    )
+}
+
+async fn delete_rejected_packages(state: &AppState, reject_keys: &[String]) -> Result<()> {
+    if reject_keys.is_empty() {
+        return Ok(());
+    }
+    if let Some(sqlite) = &state.sqlite {
+        let mut tx = sqlite.pool().begin().await?;
+        for reject_key in reject_keys {
+            sqlx::query(&format!(
+                "DELETE FROM {DISCOVERY_REJECTED_TABLE} WHERE reject_key = ?"
+            ))
+            .bind(reject_key)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        return Ok(());
+    }
+    if let Some(postgres) = &state.postgres {
+        let mut tx = postgres.pool().begin().await?;
+        for reject_key in reject_keys {
+            sqlx::query(&format!(
+                "DELETE FROM {DISCOVERY_REJECTED_TABLE} WHERE reject_key = $1"
+            ))
+            .bind(reject_key)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        return Ok(());
+    }
+    let reject_key_set = reject_keys.iter().collect::<HashSet<_>>();
+    let rejected = read_rejected_packages(state)
+        .await?
+        .into_iter()
+        .filter(|item| !reject_key_set.contains(&rejected_package_key(item)))
+        .collect::<Vec<_>>();
     state.index.write("rejected-packages.json", &rejected)?;
     Ok(())
 }
