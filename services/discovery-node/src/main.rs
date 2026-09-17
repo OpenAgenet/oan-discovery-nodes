@@ -5645,6 +5645,7 @@ fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<Resour
         }],
         authentication: vec![format!("{did}#key-1")],
         assertion_method: vec![format!("{did}#key-1")],
+        capability_invocation: vec![format!("{did}#key-1")],
         service: vec![service.clone()],
         oan_metadata: Some(OanMetadata {
             subject_type: seed.resource_type.clone(),
