@@ -33,6 +33,8 @@ use oan_storage::{DatabaseBackend, DatabaseConfig, JsonStore, PostgresJsonStore,
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{Postgres, QueryBuilder, Row, Sqlite};
+#[cfg(not(test))]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env, fs,
@@ -55,6 +57,14 @@ const DISCOVERY_CDN_CURSOR_KEY: &str = "cdn_publication_cursor";
 const DISCOVERY_QUERY_STATS_TABLE: &str = "discovery_query_stats";
 const DEFAULT_SEMANTIC_DIMENSION: usize = 64;
 const SEMANTIC_ALIASES_JSON: &str = include_str!("semantic_aliases.v1.json");
+const REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE: &str = "resource_package_unavailable";
+const REJECT_STATUS_LATE: &str = "late";
+const REJECT_STATUS_DEAD: &str = "dead";
+const LATE_PACKAGE_RETRY_INTERVAL_SECONDS: u64 = 120;
+const LATE_PACKAGE_MAX_RETRY_COUNT: u64 = 3;
+const LATE_PACKAGE_MAX_ITEMS: usize = 100;
+#[cfg(not(test))]
+const LATE_PACKAGE_IDLE_STOP_CYCLES: u64 = 5;
 
 #[derive(Clone, Debug, Default, Deserialize)]
 struct DiscoverySyncRequest {
@@ -92,6 +102,13 @@ struct DiscoveryNotificationItem {
     capability_tags: Vec<String>,
     #[serde(rename = "authorizedDomains", default)]
     authorized_domains: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+enum PackageFetchOutcome {
+    Found(ResourcePackage),
+    Unavailable(String),
+    PermanentFailure(String),
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -440,6 +457,8 @@ struct AppState {
     recommender: Arc<SemanticRecommender>,
     client: reqwest::Client,
     resource_sync_lock: Arc<Mutex<()>>,
+    #[cfg(not(test))]
+    late_package_retry_running: Arc<AtomicBool>,
     index_stats_cache: Arc<Mutex<Option<CachedIndexStats>>>,
 }
 
@@ -1063,6 +1082,8 @@ async fn main() -> Result<()> {
             discovery_stats_report_loop(report_state).await;
         });
     }
+    #[cfg(not(test))]
+    wake_late_package_retry_task(state.clone());
 
     let addr: SocketAddr = format!("{}:{}", config.server.host, config.server.port).parse()?;
     println!("discovery-node listening on http://{addr}");
@@ -1124,6 +1145,8 @@ async fn build_app_state(config: Config) -> Result<AppState> {
         recommender: Arc::new(SemanticRecommender::new()?),
         client: reqwest::Client::new(),
         resource_sync_lock: Arc::new(Mutex::new(())),
+        #[cfg(not(test))]
+        late_package_retry_running: Arc::new(AtomicBool::new(false)),
         index_stats_cache: Arc::new(Mutex::new(None)),
     };
     Ok(state)
@@ -2526,6 +2549,79 @@ async fn discovery_debug_export_loop(state: AppState) {
     }
 }
 
+#[cfg(not(test))]
+fn wake_late_package_retry_task(state: AppState) {
+    let preflight = state.clone();
+    if state
+        .late_package_retry_running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    tokio::spawn(async move {
+        if !has_late_resource_packages(&preflight).await {
+            preflight
+                .late_package_retry_running
+                .store(false, Ordering::SeqCst);
+            if has_late_resource_packages(&preflight).await {
+                wake_late_package_retry_task(preflight);
+            }
+            return;
+        }
+        late_package_retry_loop(state).await;
+    });
+}
+
+#[cfg(not(test))]
+async fn has_late_resource_packages(state: &AppState) -> bool {
+    read_rejected_packages(state)
+        .await
+        .map(|items| {
+            items.iter().any(|item| {
+                item.get("reason").and_then(Value::as_str)
+                    == Some(REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE)
+                    && rejected_package_status(item) == REJECT_STATUS_LATE
+            })
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(not(test))]
+async fn late_package_retry_loop(state: AppState) {
+    let mut empty_cycles = 0u64;
+    loop {
+        match retry_late_resource_packages_once(&state, LATE_PACKAGE_MAX_ITEMS).await {
+            Ok(report) => {
+                if report["state"] == "suspended" {
+                    break;
+                }
+                if report["lateCount"].as_u64().unwrap_or_default() == 0 {
+                    empty_cycles += 1;
+                    if empty_cycles >= LATE_PACKAGE_IDLE_STOP_CYCLES {
+                        break;
+                    }
+                } else {
+                    empty_cycles = 0;
+                }
+            }
+            Err(err) => {
+                eprintln!("late package retry failed: {err}");
+            }
+        }
+        sleep(TokioDuration::from_secs(
+            LATE_PACKAGE_RETRY_INTERVAL_SECONDS,
+        ))
+        .await;
+    }
+    state
+        .late_package_retry_running
+        .store(false, Ordering::SeqCst);
+    if has_late_resource_packages(&state).await {
+        wake_late_package_retry_task(state);
+    }
+}
+
 async fn sync_resources_from_authorized_summary(
     State(state): State<AppState>,
     Json(request): Json<DiscoverySyncRequest>,
@@ -2595,53 +2691,55 @@ async fn sync_resources_from_cdn_items(
         let package = if let Some(package) = batch_packages.get(&item.resource_did) {
             package.clone()
         } else {
-            match fetch_cdn_resource_package(&state, &cdn_base, &item.resource_did).await {
-                Ok(Some(package)) => package,
-                Ok(None) => {
-                    rejected.push(json!({
-                        "resourceDid": item.resource_did,
-                        "cursor": item.publication_cursor,
-                        "reason": "resource_package_unavailable"
-                    }));
+            match fetch_cdn_resource_package_classified(&state, &cdn_base, &item.resource_did).await
+            {
+                Ok(PackageFetchOutcome::Found(package)) => package,
+                Ok(PackageFetchOutcome::Unavailable(reason)) => {
+                    rejected.push(rejected_package_from_notification(
+                        &item,
+                        REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE,
+                        Some(reason),
+                    ));
                     blocked_cursor.get_or_insert(item.publication_cursor);
                     continue;
                 }
-                Err(err) => return Err(ApiError::internal(err)),
+                Ok(PackageFetchOutcome::PermanentFailure(reason)) => {
+                    rejected.push(rejected_package_from_notification(
+                        &item,
+                        "cdn_fetch_failed",
+                        Some(reason),
+                    ));
+                    blocked_cursor.get_or_insert(item.publication_cursor);
+                    continue;
+                }
+                Err(err) => {
+                    rejected.push(rejected_package_from_notification(
+                        &item,
+                        REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE,
+                        Some(err.to_string()),
+                    ));
+                    blocked_cursor.get_or_insert(item.publication_cursor);
+                    continue;
+                }
             }
         };
         if package.resource_did != item.resource_did {
-            rejected.push(json!({
-                "resourceDid": item.resource_did,
-                "cursor": item.publication_cursor,
-                "reason": "resource_did_mismatch"
-            }));
+            rejected.push(rejected_package_with_reason(&item, "resource_did_mismatch"));
             blocked_cursor.get_or_insert(item.publication_cursor);
             continue;
         }
         if let Err(reason) = validate_notified_resource_package(&item, &package) {
-            rejected.push(json!({
-                "resourceDid": item.resource_did,
-                "cursor": item.publication_cursor,
-                "reason": reason
-            }));
+            rejected.push(rejected_package_with_reason(&item, reason));
             blocked_cursor.get_or_insert(item.publication_cursor);
             continue;
         }
         if !authorized_domains_cover(&discovery_domains, &package.metadata.authorized_domains) {
-            rejected.push(json!({
-                "resourceDid": package.resource_did,
-                "cursor": item.publication_cursor,
-                "reason": "unauthorized_domains"
-            }));
+            rejected.push(rejected_package_with_reason(&item, "unauthorized_domains"));
             blocked_cursor.get_or_insert(item.publication_cursor);
             continue;
         }
         if let Err(reason) = validate_resource_package_for_index(&package) {
-            rejected.push(json!({
-                "resourceDid": package.resource_did,
-                "cursor": item.publication_cursor,
-                "reason": reason
-            }));
+            rejected.push(rejected_package_with_reason(&item, reason));
             blocked_cursor.get_or_insert(item.publication_cursor);
             continue;
         }
@@ -2685,9 +2783,11 @@ async fn sync_resources_from_cdn_items(
     write_sync_history_store(&state, history)
         .await
         .map_err(ApiError::internal)?;
-    write_rejected_packages(&state, &rejected)
+    merge_rejected_packages(&state, &rejected)
         .await
         .map_err(ApiError::internal)?;
+    #[cfg(not(test))]
+    wake_late_package_retry_task(state.clone());
     Ok(Json(json!({
         "status": "synced",
         "syncMode": "authorized-summary",
@@ -2747,28 +2847,52 @@ async fn fetch_cdn_resource_packages_batch(
     Ok(packages)
 }
 
-async fn fetch_cdn_resource_package(
+async fn fetch_cdn_resource_package_classified(
     state: &AppState,
     cdn_base: &str,
     resource_did: &str,
-) -> Result<Option<ResourcePackage>> {
+) -> Result<PackageFetchOutcome> {
     let encoded_did =
         url::form_urlencoded::byte_serialize(resource_did.as_bytes()).collect::<String>();
-    let response = state
+    let response = match state
         .client
         .get(format!("{cdn_base}/cdn/resources/{encoded_did}"))
         .send()
-        .await?;
+        .await
+    {
+        Ok(response) => response,
+        Err(err) if err.is_timeout() => {
+            return Ok(PackageFetchOutcome::Unavailable("cdn_timeout".to_owned()));
+        }
+        Err(err) if err.is_connect() => {
+            return Ok(PackageFetchOutcome::Unavailable(
+                "cdn_connect_failed".to_owned(),
+            ));
+        }
+        Err(err) => return Err(err.into()),
+    };
     if response.status() == StatusCode::NOT_FOUND {
-        return Ok(None);
+        return Ok(PackageFetchOutcome::Unavailable("cdn_not_found".to_owned()));
     }
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "resource_package_unavailable:{}",
-            response.status()
-        ));
+    let status = response.status();
+    if status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error() {
+        return Ok(PackageFetchOutcome::Unavailable(format!(
+            "cdn_status_{}",
+            status.as_u16()
+        )));
     }
-    Ok(Some(response.json::<ResourcePackage>().await?))
+    if !status.is_success() {
+        return Ok(PackageFetchOutcome::PermanentFailure(format!(
+            "cdn_status_{}",
+            status.as_u16()
+        )));
+    }
+    match response.json::<ResourcePackage>().await {
+        Ok(package) => Ok(PackageFetchOutcome::Found(package)),
+        Err(err) => Ok(PackageFetchOutcome::PermanentFailure(format!(
+            "cdn_decode_failed:{err}"
+        ))),
+    }
 }
 
 fn validate_notified_resource_package(
@@ -2799,6 +2923,153 @@ fn validate_notified_resource_package(
         return Err("authorized_domains_mismatch".to_owned());
     }
     Ok(())
+}
+
+fn rejected_package_from_notification(
+    item: &DiscoveryNotificationItem,
+    reason: impl Into<String>,
+    last_error: Option<String>,
+) -> Value {
+    let reason = reason.into();
+    let now = Utc::now().to_rfc3339();
+    let mut rejected = json!({
+        "resourceDid": item.resource_did,
+        "cursor": item.publication_cursor,
+        "packageVersion": item.package_version,
+        "packageHash": item.package_hash,
+        "metadataHash": item.metadata_hash,
+        "didDocumentHash": item.did_document_hash,
+        "resourceType": item.resource_type,
+        "capabilityTags": item.capability_tags,
+        "authorizedDomains": item.authorized_domains,
+        "reason": reason
+    });
+    if rejected["reason"] == REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE {
+        rejected["status"] = json!(REJECT_STATUS_LATE);
+        rejected["retryCount"] = json!(0);
+        rejected["firstSeenAt"] = json!(now);
+        rejected["lastRetryAt"] = Value::Null;
+        rejected["lastError"] = last_error.map(Value::String).unwrap_or(Value::Null);
+    }
+    rejected
+}
+
+fn rejected_package_with_reason(
+    item: &DiscoveryNotificationItem,
+    reason: impl Into<String>,
+) -> Value {
+    rejected_package_from_notification(item, reason, None)
+}
+
+fn rejected_package_status(item: &Value) -> &str {
+    item.get("status")
+        .and_then(Value::as_str)
+        .unwrap_or(REJECT_STATUS_LATE)
+}
+
+fn rejected_package_retry_count(item: &Value) -> u64 {
+    item.get("retryCount")
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+}
+
+fn rejected_package_to_notification(item: &Value) -> Option<DiscoveryNotificationItem> {
+    Some(DiscoveryNotificationItem {
+        resource_did: item
+            .get("resourceDid")
+            .or_else(|| item.get("did"))
+            .and_then(Value::as_str)?
+            .to_owned(),
+        package_version: item
+            .get("packageVersion")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        publication_cursor: item
+            .get("cursor")
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        package_hash: item
+            .get("packageHash")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        metadata_hash: item
+            .get("metadataHash")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        did_document_hash: item
+            .get("didDocumentHash")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+        resource_type: item
+            .get("resourceType")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        capability_tags: item
+            .get("capabilityTags")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+        authorized_domains: item
+            .get("authorizedDomains")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+fn rejected_package_retry_summary(items: &[Value]) -> Value {
+    let late_count = items
+        .iter()
+        .filter(|item| {
+            item.get("reason").and_then(Value::as_str)
+                == Some(REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE)
+                && rejected_package_status(item) == REJECT_STATUS_LATE
+        })
+        .count();
+    let dead_count = items
+        .iter()
+        .filter(|item| {
+            item.get("reason").and_then(Value::as_str)
+                == Some(REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE)
+                && rejected_package_status(item) == REJECT_STATUS_DEAD
+        })
+        .count();
+    json!({
+        "enabled": true,
+        "state": if late_count > LATE_PACKAGE_MAX_ITEMS {
+            "suspended"
+        } else if late_count > 0 {
+            "running"
+        } else {
+            "idle"
+        },
+        "intervalSeconds": LATE_PACKAGE_RETRY_INTERVAL_SECONDS,
+        "lateCount": late_count,
+        "deadCount": dead_count,
+        "consecutiveEmptyCycles": 0,
+        "maxLatePackages": LATE_PACKAGE_MAX_ITEMS,
+        "suspendedReason": if late_count > LATE_PACKAGE_MAX_ITEMS {
+            json!("late_package_limit_exceeded")
+        } else {
+            Value::Null
+        }
+    })
 }
 
 async fn resource_query(
@@ -3540,7 +3811,11 @@ async fn api_rejected_packages(State(state): State<AppState>) -> ApiResult<Value
     let items = read_rejected_packages(&state)
         .await
         .map_err(ApiError::internal)?;
-    Ok(Json(json!({ "items": items, "count": items.len() })))
+    Ok(Json(json!({
+        "items": items,
+        "count": items.len(),
+        "retry": rejected_package_retry_summary(&items)
+    })))
 }
 
 async fn api_backfill_rejected_packages(
@@ -3579,15 +3854,11 @@ async fn backfill_rejected_resource_packages(
 ) -> Result<Value> {
     let max_items = request.max_items.unwrap_or(100).max(1);
     let requested_dids = request.resource_dids.into_iter().collect::<BTreeSet<_>>();
-    let discovery_domains = local_discovery_authorized_domains(state)?;
     let rejected = read_rejected_packages(state).await?;
     let mut attempted = 0usize;
     let mut recovered = Vec::<Value>::new();
     let mut failed = Vec::<Value>::new();
     let mut skipped = 0usize;
-    let mut accepted = Vec::<(i64, ResourcePackage)>::new();
-    let mut resolved_reject_keys = Vec::<String>::new();
-    let mut replacement_rejections = Vec::<Value>::new();
 
     for item in rejected.iter() {
         let reason = item
@@ -3599,7 +3870,8 @@ async fn backfill_rejected_resource_packages(
             .or_else(|| item.get("did"))
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if reason != "resource_package_unavailable"
+        if reason != REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE
+            || rejected_package_status(item) == REJECT_STATUS_DEAD
             || resource_did.is_empty()
             || (!requested_dids.is_empty() && !requested_dids.contains(resource_did))
         {
@@ -3615,53 +3887,39 @@ async fn backfill_rejected_resource_packages(
             .get("cursor")
             .and_then(Value::as_i64)
             .unwrap_or_default();
-        match fetch_cdn_resource_package(state, cdn_base, resource_did).await {
-            Ok(Some(package)) => {
-                let reject_reason = if package.resource_did != resource_did {
-                    Some("resource_did_mismatch".to_owned())
-                } else if !authorized_domains_cover(
-                    &discovery_domains,
-                    &package.metadata.authorized_domains,
-                ) {
-                    Some("unauthorized_domains".to_owned())
-                } else {
-                    validate_resource_package_for_index(&package).err()
-                };
-                if let Some(reason) = reject_reason {
-                    let replacement = json!({
-                        "resourceDid": resource_did,
-                        "cursor": cursor,
-                        "reason": reason
-                    });
-                    failed.push(replacement.clone());
-                    replacement_rejections.push(replacement);
-                    resolved_reject_keys.push(rejected_package_key(item));
-                    continue;
-                }
+        match recover_rejected_package_once(state, cdn_base, item).await? {
+            RejectedPackageRecoveryResult::Recovered => {
                 recovered.push(json!({
                     "resourceDid": resource_did,
                     "cursor": cursor
                 }));
-                resolved_reject_keys.push(rejected_package_key(item));
-                accepted.push((cursor, package));
             }
-            Ok(None) => failed.push(json!({
+            RejectedPackageRecoveryResult::StillLate(updated) => failed.push(json!({
                 "resourceDid": resource_did,
                 "cursor": cursor,
-                "reason": "resource_package_unavailable"
+                "reason": REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE,
+                "status": updated["status"],
+                "retryCount": updated["retryCount"],
+                "lastError": updated["lastError"]
             })),
-            Err(err) => failed.push(json!({
+            RejectedPackageRecoveryResult::Dead(updated) => failed.push(json!({
                 "resourceDid": resource_did,
                 "cursor": cursor,
-                "reason": "cdn_fetch_failed",
-                "error": err.to_string()
+                "reason": REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE,
+                "status": updated["status"],
+                "retryCount": updated["retryCount"],
+                "lastError": updated["lastError"]
+            })),
+            RejectedPackageRecoveryResult::ReplacementRejected(updated) => failed.push(json!({
+                "resourceDid": resource_did,
+                "cursor": cursor,
+                "reason": updated["reason"],
+                "status": updated["status"],
+                "lastError": updated["lastError"]
             })),
         }
     }
 
-    upsert_indexed_resource_packages_batch(state, &accepted).await?;
-    delete_rejected_packages(state, &resolved_reject_keys).await?;
-    write_rejected_packages(state, &replacement_rejections).await?;
     let remaining_rejected_count = read_rejected_packages(state).await?.len();
 
     Ok(json!({
@@ -3675,6 +3933,208 @@ async fn backfill_rejected_resource_packages(
         "recovered": recovered,
         "failed": failed
     }))
+}
+
+async fn retry_late_resource_packages_once(state: &AppState, max_items: usize) -> Result<Value> {
+    let _sync_guard = state.resource_sync_lock.lock().await;
+    let rejected = read_rejected_packages(state).await?;
+    let late_items = rejected
+        .iter()
+        .filter(|item| {
+            item.get("reason").and_then(Value::as_str)
+                == Some(REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE)
+                && rejected_package_status(item) == REJECT_STATUS_LATE
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if late_items.len() > LATE_PACKAGE_MAX_ITEMS {
+        return Ok(json!({
+            "state": "suspended",
+            "lateCount": late_items.len(),
+            "attemptedCount": 0,
+            "recoveredCount": 0,
+            "failedCount": 0,
+            "suspendedReason": "late_package_limit_exceeded"
+        }));
+    }
+    let cdn_base = state
+        .config
+        .upstream
+        .cdn_endpoint
+        .clone()
+        .unwrap_or_else(|| state.config.upstream.root_endpoint.clone())
+        .trim_end_matches('/')
+        .to_owned();
+    let mut attempted = 0usize;
+    let mut recovered = 0usize;
+    let mut failed = 0usize;
+    for item in late_items.into_iter().take(max_items.max(1)) {
+        attempted += 1;
+        match recover_rejected_package_once(state, &cdn_base, &item).await? {
+            RejectedPackageRecoveryResult::Recovered => recovered += 1,
+            RejectedPackageRecoveryResult::StillLate(_)
+            | RejectedPackageRecoveryResult::Dead(_)
+            | RejectedPackageRecoveryResult::ReplacementRejected(_) => failed += 1,
+        }
+    }
+    let remaining = read_rejected_packages(state).await?;
+    let late_count = remaining
+        .iter()
+        .filter(|item| {
+            item.get("reason").and_then(Value::as_str)
+                == Some(REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE)
+                && rejected_package_status(item) == REJECT_STATUS_LATE
+        })
+        .count();
+    Ok(json!({
+        "state": if late_count > 0 { "running" } else { "idle" },
+        "lateCount": late_count,
+        "attemptedCount": attempted,
+        "recoveredCount": recovered,
+        "failedCount": failed
+    }))
+}
+
+enum RejectedPackageRecoveryResult {
+    Recovered,
+    StillLate(Value),
+    Dead(Value),
+    ReplacementRejected(Value),
+}
+
+async fn recover_rejected_package_once(
+    state: &AppState,
+    cdn_base: &str,
+    item: &Value,
+) -> Result<RejectedPackageRecoveryResult> {
+    let resource_did = rejected_package_resource_did(item).to_owned();
+    let reject_key = rejected_package_key(item);
+    let cursor = item
+        .get("cursor")
+        .and_then(Value::as_i64)
+        .unwrap_or_default();
+    if resource_did.is_empty() || resource_did == "unknown" {
+        let replacement = update_rejected_package_validation_failure(
+            item,
+            "missing_resource_did",
+            "missing_resource_did",
+        );
+        write_rejected_packages(state, &[replacement.clone()]).await?;
+        return Ok(RejectedPackageRecoveryResult::ReplacementRejected(
+            replacement,
+        ));
+    }
+    if let Some(indexed) = read_indexed_resource_package(state, &resource_did).await? {
+        let indexed_cursor = read_indexed_resource_cursor(state, &resource_did)
+            .await?
+            .unwrap_or_default();
+        if indexed_cursor >= cursor || indexed.package_version == item["packageVersion"] {
+            delete_rejected_packages(state, &[reject_key]).await?;
+            return Ok(RejectedPackageRecoveryResult::Recovered);
+        }
+    }
+    let Some(notification) = rejected_package_to_notification(item) else {
+        let replacement = update_rejected_package_validation_failure(
+            item,
+            "missing_notification_context",
+            "missing_notification_context",
+        );
+        write_rejected_packages(state, &[replacement.clone()]).await?;
+        return Ok(RejectedPackageRecoveryResult::ReplacementRejected(
+            replacement,
+        ));
+    };
+    if notification.package_hash.is_empty()
+        || notification.metadata_hash.is_empty()
+        || notification.did_document_hash.is_empty()
+        || notification.authorized_domains.is_empty()
+    {
+        let replacement = update_rejected_package_validation_failure(
+            item,
+            "missing_notification_context",
+            "missing_notification_context",
+        );
+        write_rejected_packages(state, &[replacement.clone()]).await?;
+        return Ok(RejectedPackageRecoveryResult::ReplacementRejected(
+            replacement,
+        ));
+    }
+    match fetch_cdn_resource_package_classified(state, cdn_base, &resource_did).await? {
+        PackageFetchOutcome::Found(package) => {
+            let discovery_domains = local_discovery_authorized_domains(state)?;
+            let reject_reason = if package.resource_did != resource_did {
+                Some("resource_did_mismatch".to_owned())
+            } else if let Err(reason) = validate_notified_resource_package(&notification, &package)
+            {
+                Some(reason)
+            } else if !authorized_domains_cover(
+                &discovery_domains,
+                &package.metadata.authorized_domains,
+            ) {
+                Some("unauthorized_domains".to_owned())
+            } else {
+                validate_resource_package_for_index(&package).err()
+            };
+            if let Some(reason) = reject_reason {
+                let replacement =
+                    update_rejected_package_validation_failure(item, &reason, &reason);
+                write_rejected_packages(state, &[replacement.clone()]).await?;
+                return Ok(RejectedPackageRecoveryResult::ReplacementRejected(
+                    replacement,
+                ));
+            }
+            upsert_indexed_resource_package_without_reject_cleanup(state, cursor, package).await?;
+            delete_rejected_packages(state, &[reject_key]).await?;
+            Ok(RejectedPackageRecoveryResult::Recovered)
+        }
+        PackageFetchOutcome::Unavailable(reason) => {
+            let updated = update_rejected_package_retry_failure(item, &reason);
+            write_rejected_packages(state, &[updated.clone()]).await?;
+            if rejected_package_status(&updated) == REJECT_STATUS_DEAD {
+                Ok(RejectedPackageRecoveryResult::Dead(updated))
+            } else {
+                Ok(RejectedPackageRecoveryResult::StillLate(updated))
+            }
+        }
+        PackageFetchOutcome::PermanentFailure(reason) => {
+            let replacement =
+                update_rejected_package_validation_failure(item, "cdn_fetch_failed", &reason);
+            write_rejected_packages(state, &[replacement.clone()]).await?;
+            Ok(RejectedPackageRecoveryResult::ReplacementRejected(
+                replacement,
+            ))
+        }
+    }
+}
+
+fn update_rejected_package_retry_failure(item: &Value, last_error: &str) -> Value {
+    let mut updated = item.clone();
+    let retry_count = rejected_package_retry_count(item) + 1;
+    updated["status"] = json!(if retry_count >= LATE_PACKAGE_MAX_RETRY_COUNT {
+        REJECT_STATUS_DEAD
+    } else {
+        REJECT_STATUS_LATE
+    });
+    updated["retryCount"] = json!(retry_count);
+    updated["lastRetryAt"] = json!(Utc::now().to_rfc3339());
+    updated["lastError"] = json!(last_error);
+    if updated.get("firstSeenAt").and_then(Value::as_str).is_none() {
+        updated["firstSeenAt"] = json!(Utc::now().to_rfc3339());
+    }
+    updated
+}
+
+fn update_rejected_package_validation_failure(
+    item: &Value,
+    reason: &str,
+    last_error: &str,
+) -> Value {
+    let mut updated = item.clone();
+    updated["reason"] = json!(reason);
+    updated["status"] = Value::Null;
+    updated["lastRetryAt"] = json!(Utc::now().to_rfc3339());
+    updated["lastError"] = json!(last_error);
+    updated
 }
 
 async fn audit_resolved_rejected_packages(
@@ -3821,6 +4281,14 @@ async fn upsert_indexed_resource_packages_batch(
     state: &AppState,
     packages: &[(i64, ResourcePackage)],
 ) -> Result<()> {
+    upsert_indexed_resource_packages_batch_with_cleanup(state, packages, true).await
+}
+
+async fn upsert_indexed_resource_packages_batch_with_cleanup(
+    state: &AppState,
+    packages: &[(i64, ResourcePackage)],
+    cleanup_rejected_by_did: bool,
+) -> Result<()> {
     if packages.is_empty() {
         return Ok(());
     }
@@ -3871,7 +4339,9 @@ async fn upsert_indexed_resource_packages_batch(
             builder.build().execute(&mut *tx).await?;
         }
         tx.commit().await?;
-        delete_rejected_packages_by_did(state, &accepted_dids).await?;
+        if cleanup_rejected_by_did {
+            delete_rejected_packages_by_did(state, &accepted_dids).await?;
+        }
         return Ok(());
     }
     if let Some(postgres) = &state.postgres {
@@ -3931,7 +4401,9 @@ async fn upsert_indexed_resource_packages_batch(
             builder.build().execute(&mut *tx).await?;
         }
         tx.commit().await?;
-        delete_rejected_packages_by_did(state, &accepted_dids).await?;
+        if cleanup_rejected_by_did {
+            delete_rejected_packages_by_did(state, &accepted_dids).await?;
+        }
         if semantic_search_available(state) {
             if let Err(err) = upsert_semantic_index_batch_with_retries(
                 state,
@@ -3951,8 +4423,18 @@ async fn upsert_indexed_resource_packages_batch(
         indexed.push(package.clone());
     }
     state.index.write("resource-capabilities.json", &indexed)?;
-    delete_rejected_packages_by_did(state, &accepted_dids).await?;
+    if cleanup_rejected_by_did {
+        delete_rejected_packages_by_did(state, &accepted_dids).await?;
+    }
     Ok(())
+}
+
+async fn upsert_indexed_resource_package_without_reject_cleanup(
+    state: &AppState,
+    cursor: i64,
+    package: ResourcePackage,
+) -> Result<()> {
+    upsert_indexed_resource_packages_batch_with_cleanup(state, &[(cursor, package)], false).await
 }
 
 fn latest_resource_packages_by_did(
@@ -5022,6 +5504,28 @@ async fn read_indexed_resource_package(
         .find(|package| package.resource_did == did))
 }
 
+async fn read_indexed_resource_cursor(state: &AppState, did: &str) -> Result<Option<i64>> {
+    if let Some(sqlite) = &state.sqlite {
+        let row = sqlx::query(&format!(
+            "SELECT cursor FROM {DISCOVERY_PACKAGE_TABLE} WHERE resource_did = ?"
+        ))
+        .bind(did)
+        .fetch_optional(sqlite.pool())
+        .await?;
+        return Ok(row.map(|row| row.get::<i64, _>(0)));
+    }
+    if let Some(postgres) = &state.postgres {
+        let row = sqlx::query(&format!(
+            "SELECT cursor FROM {DISCOVERY_PACKAGE_TABLE} WHERE resource_did = $1"
+        ))
+        .bind(did)
+        .fetch_optional(postgres.pool())
+        .await?;
+        return Ok(row.map(|row| row.get::<i64, _>(0)));
+    }
+    Ok(read_indexed_resource_package(state, did).await?.map(|_| 0))
+}
+
 async fn indexed_resource_visibility(state: &AppState, dids: &[String]) -> Result<Vec<String>> {
     if dids.is_empty() {
         return Ok(Vec::new());
@@ -6030,6 +6534,57 @@ async fn write_rejected_packages(state: &AppState, rejected: &[Value]) -> Result
     }
     state.index.write("rejected-packages.json", &rejected)?;
     Ok(())
+}
+
+async fn merge_rejected_packages(state: &AppState, rejected: &[Value]) -> Result<()> {
+    if rejected.is_empty() {
+        return Ok(());
+    }
+    let existing = read_rejected_packages(state).await?;
+    let existing_by_key = existing
+        .into_iter()
+        .map(|item| (rejected_package_key(&item), item))
+        .collect::<BTreeMap<_, _>>();
+    let merged = rejected
+        .iter()
+        .map(|item| {
+            let key = rejected_package_key(item);
+            merge_rejected_package_item(existing_by_key.get(&key), item)
+        })
+        .collect::<Vec<_>>();
+    write_rejected_packages(state, &merged).await
+}
+
+fn merge_rejected_package_item(existing: Option<&Value>, incoming: &Value) -> Value {
+    let Some(existing) = existing else {
+        return incoming.clone();
+    };
+    let mut merged = incoming.clone();
+    if existing.get("reason").and_then(Value::as_str)
+        == Some(REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE)
+        && incoming.get("reason").and_then(Value::as_str)
+            == Some(REJECT_REASON_RESOURCE_PACKAGE_UNAVAILABLE)
+    {
+        merged["status"] = existing
+            .get("status")
+            .cloned()
+            .unwrap_or_else(|| json!(REJECT_STATUS_LATE));
+        merged["retryCount"] = existing
+            .get("retryCount")
+            .cloned()
+            .unwrap_or_else(|| json!(0));
+        merged["firstSeenAt"] = existing
+            .get("firstSeenAt")
+            .cloned()
+            .unwrap_or_else(|| json!(Utc::now().to_rfc3339()));
+        merged["lastRetryAt"] = existing.get("lastRetryAt").cloned().unwrap_or(Value::Null);
+        merged["lastError"] = incoming
+            .get("lastError")
+            .cloned()
+            .or_else(|| existing.get("lastError").cloned())
+            .unwrap_or(Value::Null);
+    }
+    merged
 }
 
 fn rejected_package_key(item: &Value) -> String {
