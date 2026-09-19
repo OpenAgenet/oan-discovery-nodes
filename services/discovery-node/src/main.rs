@@ -13,6 +13,7 @@ use axum::{
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{Datelike, Utc};
+use futures::TryStreamExt;
 use jieba_rs::Jieba;
 use oan_core::{
     CryptoSuite, DidDocument, ImplementationLink, OanMetadata, ProtocolBinding,
@@ -67,6 +68,8 @@ const LATE_PACKAGE_MAX_ITEMS: usize = 100;
 const DISCOVERY_DEFAULT_PAGE_SIZE: u32 = 100;
 const DISCOVERY_MAX_PAGE_SIZE: u32 = 500;
 const DISCOVERY_SEMANTIC_REBUILD_PAGE_SIZE: u32 = 100;
+const DISCOVERY_INDEX_PACKAGE_BYTES: usize = 8 * 1024 * 1024;
+const DISCOVERY_INDEX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 #[cfg(not(test))]
 const LATE_PACKAGE_IDLE_STOP_CYCLES: u64 = 5;
 
@@ -3673,7 +3676,12 @@ async fn api_index_resources(
         limit,
     )
     .await
-    .map_err(ApiError::internal)?;
+    .map_err(|error| match error.to_string().as_str() {
+        "discovery_index_package_too_large" | "discovery_index_page_too_large" => {
+            ApiError::bad_request(error.to_string())
+        }
+        _ => ApiError::internal(error),
+    })?;
     Ok(Json(json!({
         "items": page.items,
         "count": page.items.len(),
@@ -6370,11 +6378,12 @@ async fn read_indexed_resource_page(
     limit: u32,
 ) -> Result<CursorPage<(i64, ResourcePackage)>> {
     let page_limit = i64::from(limit.max(1));
-    let fetch_limit = page_limit + 1;
     let mut items = Vec::new();
+    let mut page_bytes = 0_usize;
+    let mut has_more = false;
     if let Some(sqlite) = &state.sqlite {
-        let rows = if let Some(after_resource_did) = after_resource_did {
-            sqlx::query(&format!(
+        if let Some(after_resource_did) = after_resource_did {
+            let query = format!(
                 r#"
                 SELECT cursor, package_json
                 FROM {DISCOVERY_PACKAGE_TABLE}
@@ -6382,15 +6391,31 @@ async fn read_indexed_resource_page(
                 ORDER BY cursor, resource_did
                 LIMIT ?
                 "#
-            ))
-            .bind(after_cursor)
-            .bind(after_cursor)
-            .bind(after_resource_did)
-            .bind(fetch_limit)
-            .fetch_all(sqlite.pool())
-            .await?
+            );
+            let mut rows = sqlx::query(&query)
+                .bind(after_cursor)
+                .bind(after_cursor)
+                .bind(after_resource_did)
+                .bind(page_limit)
+                .fetch(sqlite.pool());
+            while let Some(row) = rows.try_next().await? {
+                push_indexed_resource_page_item(
+                    &mut items,
+                    &mut page_bytes,
+                    row.get::<i64, _>(0),
+                    &row.get::<String, _>(1),
+                )?;
+            }
+            has_more = indexed_resource_page_has_more_sqlite(
+                state,
+                items
+                    .last()
+                    .map(|(cursor, package)| (*cursor, package.resource_did.as_str()))
+                    .or_else(|| after_resource_did.map(|did| (after_cursor, did))),
+            )
+            .await?;
         } else {
-            sqlx::query(&format!(
+            let query = format!(
                 r#"
                 SELECT cursor, package_json
                 FROM {DISCOVERY_PACKAGE_TABLE}
@@ -6398,21 +6423,30 @@ async fn read_indexed_resource_page(
                 ORDER BY cursor, resource_did
                 LIMIT ?
                 "#
-            ))
+            );
+            let mut rows = sqlx::query(&query)
             .bind(after_cursor)
-            .bind(fetch_limit)
-            .fetch_all(sqlite.pool())
-            .await?
-        };
-        for row in rows {
-            items.push((
-                row.get::<i64, _>(0),
-                serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))?,
-            ));
+            .bind(page_limit)
+            .fetch(sqlite.pool());
+            while let Some(row) = rows.try_next().await? {
+                push_indexed_resource_page_item(
+                    &mut items,
+                    &mut page_bytes,
+                    row.get::<i64, _>(0),
+                    &row.get::<String, _>(1),
+                )?;
+            }
+            has_more = indexed_resource_page_has_more_sqlite(
+                state,
+                items
+                    .last()
+                    .map(|(cursor, package)| (*cursor, package.resource_did.as_str())),
+            )
+            .await?;
         }
     } else if let Some(postgres) = &state.postgres {
-        let rows = if let Some(after_resource_did) = after_resource_did {
-            sqlx::query(&format!(
+        if let Some(after_resource_did) = after_resource_did {
+            let query = format!(
                 r#"
                 SELECT cursor, package_json::text
                 FROM {DISCOVERY_PACKAGE_TABLE}
@@ -6420,14 +6454,30 @@ async fn read_indexed_resource_page(
                 ORDER BY cursor, resource_did
                 LIMIT $3
                 "#
-            ))
-            .bind(after_cursor)
-            .bind(after_resource_did)
-            .bind(fetch_limit)
-            .fetch_all(postgres.pool())
-            .await?
+            );
+            let mut rows = sqlx::query(&query)
+                .bind(after_cursor)
+                .bind(after_resource_did)
+                .bind(page_limit)
+                .fetch(postgres.pool());
+            while let Some(row) = rows.try_next().await? {
+                push_indexed_resource_page_item(
+                    &mut items,
+                    &mut page_bytes,
+                    row.get::<i64, _>(0),
+                    &row.get::<String, _>(1),
+                )?;
+            }
+            has_more = indexed_resource_page_has_more_postgres(
+                state,
+                items
+                    .last()
+                    .map(|(cursor, package)| (*cursor, package.resource_did.as_str()))
+                    .or_else(|| after_resource_did.map(|did| (after_cursor, did))),
+            )
+            .await?;
         } else {
-            sqlx::query(&format!(
+            let query = format!(
                 r#"
                 SELECT cursor, package_json::text
                 FROM {DISCOVERY_PACKAGE_TABLE}
@@ -6435,17 +6485,26 @@ async fn read_indexed_resource_page(
                 ORDER BY cursor, resource_did
                 LIMIT $2
                 "#
-            ))
+            );
+            let mut rows = sqlx::query(&query)
             .bind(after_cursor)
-            .bind(fetch_limit)
-            .fetch_all(postgres.pool())
-            .await?
-        };
-        for row in rows {
-            items.push((
-                row.get::<i64, _>(0),
-                serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))?,
-            ));
+            .bind(page_limit)
+            .fetch(postgres.pool());
+            while let Some(row) = rows.try_next().await? {
+                push_indexed_resource_page_item(
+                    &mut items,
+                    &mut page_bytes,
+                    row.get::<i64, _>(0),
+                    &row.get::<String, _>(1),
+                )?;
+            }
+            has_more = indexed_resource_page_has_more_postgres(
+                state,
+                items
+                    .last()
+                    .map(|(cursor, package)| (*cursor, package.resource_did.as_str())),
+            )
+            .await?;
         }
     } else {
         let mut indexed = state
@@ -6468,11 +6527,20 @@ async fn read_indexed_resource_page(
                 .cmp(&right.0)
                 .then(left.1.resource_did.cmp(&right.1.resource_did))
         });
-        items = indexed.into_iter().take(fetch_limit as usize).collect();
-    }
-    let has_more = items.len() as i64 > page_limit;
-    if has_more {
-        items.truncate(page_limit as usize);
+        items = indexed.into_iter().take(page_limit as usize).collect();
+        let mut bounded_items = Vec::with_capacity(items.len());
+        for (cursor, package) in items {
+            let package_json = serde_json::to_vec(&package)?;
+            if package_json.len() > DISCOVERY_INDEX_PACKAGE_BYTES {
+                return Err(anyhow!("discovery_index_package_too_large"));
+            }
+            page_bytes = page_bytes.saturating_add(package_json.len());
+            if page_bytes > DISCOVERY_INDEX_PAGE_BYTES {
+                return Err(anyhow!("discovery_index_page_too_large"));
+            }
+            bounded_items.push((cursor, package));
+        }
+        items = bounded_items;
     }
     let next_cursor = items
         .last()
@@ -6506,6 +6574,72 @@ async fn read_indexed_resource_summary_page(
             .map(|(cursor, package)| resource_package_summary(cursor, &package))
             .collect(),
     })
+}
+
+async fn indexed_resource_page_has_more_sqlite(
+    state: &AppState,
+    position: Option<(i64, &str)>,
+) -> Result<bool> {
+    let Some(sqlite) = &state.sqlite else {
+        return Ok(false);
+    };
+    let Some((cursor, resource_did)) = position else {
+        return Ok(false);
+    };
+    Ok(sqlx::query(&format!(
+        "SELECT 1 FROM {DISCOVERY_PACKAGE_TABLE}
+         WHERE cursor > ? OR (cursor = ? AND resource_did > ?)
+         LIMIT 1"
+    ))
+    .bind(cursor)
+    .bind(cursor)
+    .bind(resource_did)
+    .fetch_optional(sqlite.pool())
+    .await?
+    .is_some())
+}
+
+async fn indexed_resource_page_has_more_postgres(
+    state: &AppState,
+    position: Option<(i64, &str)>,
+) -> Result<bool> {
+    let Some(postgres) = &state.postgres else {
+        return Ok(false);
+    };
+    let Some((cursor, resource_did)) = position else {
+        return Ok(false);
+    };
+    Ok(sqlx::query(&format!(
+        "SELECT 1 FROM {DISCOVERY_PACKAGE_TABLE}
+         WHERE cursor > $1 OR (cursor = $1 AND resource_did > $2)
+         LIMIT 1"
+    ))
+    .bind(cursor)
+    .bind(resource_did)
+    .fetch_optional(postgres.pool())
+    .await?
+    .is_some())
+}
+
+fn push_indexed_resource_page_item(
+    items: &mut Vec<(i64, ResourcePackage)>,
+    page_bytes: &mut usize,
+    cursor: i64,
+    package_json: &str,
+) -> Result<()> {
+    let package_bytes = package_json.len();
+    if package_bytes > DISCOVERY_INDEX_PACKAGE_BYTES {
+        return Err(anyhow!("discovery_index_package_too_large"));
+    }
+    *page_bytes = page_bytes.saturating_add(package_bytes);
+    if *page_bytes > DISCOVERY_INDEX_PAGE_BYTES {
+        return Err(anyhow!("discovery_index_page_too_large"));
+    }
+    items.push((
+        cursor,
+        serde_json::from_str::<ResourcePackage>(package_json)?,
+    ));
+    Ok(())
 }
 
 async fn read_visible_indexed_resource_did_page(
