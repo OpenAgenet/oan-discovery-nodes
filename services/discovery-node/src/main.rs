@@ -73,6 +73,16 @@ const DISCOVERY_INDEX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 #[cfg(not(test))]
 const LATE_PACKAGE_IDLE_STOP_CYCLES: u64 = 5;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LatePackageRetryExit {
+    Idle,
+    Suspended,
+}
+
+fn should_rewake_late_package_retry(exit: LatePackageRetryExit, has_late: bool) -> bool {
+    has_late && exit != LatePackageRetryExit::Suspended
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 struct DiscoverySyncRequest {
     #[serde(rename = "maxPublications", default)]
@@ -2622,10 +2632,12 @@ async fn has_late_resource_packages(state: &AppState) -> bool {
 #[cfg(not(test))]
 async fn late_package_retry_loop(state: AppState) {
     let mut empty_cycles = 0u64;
+    let mut exit = LatePackageRetryExit::Idle;
     loop {
         match retry_late_resource_packages_once(&state, LATE_PACKAGE_MAX_ITEMS).await {
             Ok(report) => {
                 if report["state"] == "suspended" {
+                    exit = LatePackageRetryExit::Suspended;
                     break;
                 }
                 if report["lateCount"].as_u64().unwrap_or_default() == 0 {
@@ -2649,7 +2661,7 @@ async fn late_package_retry_loop(state: AppState) {
     state
         .late_package_retry_running
         .store(false, Ordering::SeqCst);
-    if has_late_resource_packages(&state).await {
+    if should_rewake_late_package_retry(exit, has_late_resource_packages(&state).await) {
         wake_late_package_retry_task(state);
     }
 }
@@ -3003,6 +3015,36 @@ fn rejected_package_retry_count(item: &Value) -> u64 {
     item.get("retryCount")
         .and_then(Value::as_u64)
         .unwrap_or_default()
+}
+
+fn rejected_package_cursor(item: &Value) -> Option<i64> {
+    item.get("cursor").and_then(Value::as_i64)
+}
+
+fn rejected_package_version(item: &Value) -> Option<&str> {
+    item.get("packageVersion").and_then(Value::as_str)
+}
+
+fn is_stale_rejected_for_indexed_did(
+    item: &Value,
+    resource_did: &str,
+    indexed_cursor: i64,
+    indexed_version: Option<&str>,
+) -> bool {
+    if rejected_package_resource_did(item) != resource_did {
+        return false;
+    }
+    if rejected_package_cursor(item).is_some_and(|cursor| cursor <= indexed_cursor) {
+        return true;
+    }
+    if let Some(indexed_version) = indexed_version {
+        if !indexed_version.is_empty()
+            && rejected_package_version(item).is_some_and(|version| version == indexed_version)
+        {
+            return true;
+        }
+    }
+    rejected_package_cursor(item).is_none()
 }
 
 fn rejected_package_to_notification(item: &Value) -> Option<DiscoveryNotificationItem> {
@@ -4187,7 +4229,6 @@ async fn recover_rejected_package_once(
     item: &Value,
 ) -> Result<RejectedPackageRecoveryResult> {
     let resource_did = rejected_package_resource_did(item).to_owned();
-    let reject_key = rejected_package_key(item);
     let cursor = item
         .get("cursor")
         .and_then(Value::as_i64)
@@ -4208,7 +4249,13 @@ async fn recover_rejected_package_once(
             .await?
             .unwrap_or_default();
         if indexed_cursor >= cursor || indexed.package_version == item["packageVersion"] {
-            delete_rejected_packages(state, &[reject_key]).await?;
+            delete_stale_rejected_packages_for_indexed_did(
+                state,
+                &resource_did,
+                indexed_cursor,
+                Some(&indexed.package_version),
+            )
+            .await?;
             return Ok(RejectedPackageRecoveryResult::Recovered);
         }
     }
@@ -4263,8 +4310,15 @@ async fn recover_rejected_package_once(
                     replacement,
                 ));
             }
+            let package_version = package.package_version.clone();
             upsert_indexed_resource_package_without_reject_cleanup(state, cursor, package).await?;
-            delete_rejected_packages(state, &[reject_key]).await?;
+            delete_stale_rejected_packages_for_indexed_did(
+                state,
+                &resource_did,
+                cursor,
+                Some(&package_version),
+            )
+            .await?;
             Ok(RejectedPackageRecoveryResult::Recovered)
         }
         PackageFetchOutcome::Unavailable(reason) => {
@@ -7370,6 +7424,60 @@ async fn delete_rejected_packages_by_did(state: &AppState, resource_dids: &[Stri
         .collect::<Vec<_>>();
     state.index.write("rejected-packages.json", &rejected)?;
     Ok(())
+}
+
+async fn delete_stale_rejected_packages_for_indexed_did(
+    state: &AppState,
+    resource_did: &str,
+    indexed_cursor: i64,
+    indexed_version: Option<&str>,
+) -> Result<()> {
+    if resource_did.is_empty() || resource_did == "unknown" {
+        return Ok(());
+    }
+    if let Some(sqlite) = &state.sqlite {
+        let mut query = QueryBuilder::<Sqlite>::new(format!(
+            "DELETE FROM {DISCOVERY_REJECTED_TABLE} WHERE (json_extract(item_json, '$.resourceDid') = "
+        ));
+        query.push_bind(resource_did);
+        query.push(" OR json_extract(item_json, '$.did') = ");
+        query.push_bind(resource_did);
+        query.push(") AND (json_extract(item_json, '$.cursor') IS NULL OR json_extract(item_json, '$.cursor') <= ");
+        query.push_bind(indexed_cursor);
+        if let Some(indexed_version) = indexed_version.filter(|version| !version.is_empty()) {
+            query.push(" OR json_extract(item_json, '$.packageVersion') = ");
+            query.push_bind(indexed_version);
+        }
+        query.push(")");
+        query.build().execute(sqlite.pool()).await?;
+        return Ok(());
+    }
+    if let Some(postgres) = &state.postgres {
+        let mut query = QueryBuilder::<Postgres>::new(format!(
+            "DELETE FROM {DISCOVERY_REJECTED_TABLE} WHERE (item_json->>'resourceDid' = "
+        ));
+        query.push_bind(resource_did);
+        query.push(" OR item_json->>'did' = ");
+        query.push_bind(resource_did);
+        query.push(") AND (item_json->>'cursor' IS NULL OR (item_json->>'cursor')::bigint <= ");
+        query.push_bind(indexed_cursor);
+        if let Some(indexed_version) = indexed_version.filter(|version| !version.is_empty()) {
+            query.push(" OR item_json->>'packageVersion' = ");
+            query.push_bind(indexed_version);
+        }
+        query.push(")");
+        query.build().execute(postgres.pool()).await?;
+        return Ok(());
+    }
+    let keys = read_rejected_packages(state)
+        .await?
+        .into_iter()
+        .filter(|item| {
+            is_stale_rejected_for_indexed_did(item, resource_did, indexed_cursor, indexed_version)
+        })
+        .map(|item| rejected_package_key(&item))
+        .collect::<Vec<_>>();
+    delete_rejected_packages(state, &keys).await
 }
 
 async fn delete_rejected_packages(state: &AppState, reject_keys: &[String]) -> Result<()> {
