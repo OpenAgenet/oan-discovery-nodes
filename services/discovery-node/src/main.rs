@@ -17,7 +17,7 @@ use futures::TryStreamExt;
 use jieba_rs::Jieba;
 use oan_core::{
     CryptoSuite, DidDocument, ImplementationLink, OanMetadata, ProtocolBinding,
-    ResourceDescription, ResourceType, ServiceEndpoint, VerificationMethod,
+    ResourceDescription, ResourceType, ServiceEndpoint, SubjectType, VerificationMethod,
 };
 use oan_crypto::{hash_json_with_suite, sha256_hex, signing_key_from_bytes};
 use oan_package::{
@@ -6864,6 +6864,7 @@ fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<Resour
     let did_document = DidDocument {
         context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
         id: did.clone(),
+        controller: Some(oan_core::DidController::Did(did.clone())),
         verification_method: vec![VerificationMethod {
             id: format!("{did}#key-1"),
             method_type: "Ed25519VerificationKey2020".to_owned(),
@@ -6877,13 +6878,20 @@ fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<Resour
         assertion_method: vec![format!("{did}#key-1")],
         capability_invocation: vec![format!("{did}#key-1")],
         service: vec![service.clone()],
+        proof: None,
         oan_metadata: Some(OanMetadata {
-            subject_type: seed.resource_type.clone(),
+            subject_type: match seed.resource_type {
+                ResourceType::AgentService => SubjectType::AgentService,
+                ResourceType::Skill => SubjectType::Skill,
+                ResourceType::McpServer => SubjectType::McpServer,
+                ResourceType::ToolApi => SubjectType::ToolApi,
+                _ => SubjectType::Unspecified,
+            },
             resource_type: seed.resource_type.clone(),
-            node_role: None,
+            external_identifiers: vec![],
             identity_type: None,
             controller_did: None,
-            publisher_did: Some("did:oan:AGUS:semantic-evaluation-publisher".to_owned()),
+            publisher_did: Some("did:oan:R4tYu:semantic-evaluation-publisher".to_owned()),
             issuer_did: None,
             ttl: None,
             resource_description: Some(description),
@@ -6918,8 +6926,14 @@ fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<Resour
         metadata: ResourceMetadata {
             resource_did: did.clone(),
             resource_type: seed.resource_type.clone(),
-            subject_type: seed.resource_type.clone(),
-            publisher_did: Some("did:oan:AGUS:semantic-evaluation-publisher".to_owned()),
+            subject_type: match seed.resource_type {
+                ResourceType::AgentService => SubjectType::AgentService,
+                ResourceType::Skill => SubjectType::Skill,
+                ResourceType::McpServer => SubjectType::McpServer,
+                ResourceType::ToolApi => SubjectType::ToolApi,
+                _ => SubjectType::Unspecified,
+            },
+            publisher_did: Some("did:oan:R4tYu:semantic-evaluation-publisher".to_owned()),
             subject_did: Some(did.clone()),
             name: seed.name.clone(),
             description: seed.description.clone(),
@@ -6935,7 +6949,7 @@ fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<Resour
             updated_at: Utc::now(),
         },
         root_proof: RootProof {
-            root_did: "did:oan:AGRT:semantic-evaluation-root".to_owned(),
+            root_did: "did:oan:QwErT:semantic-evaluation-root".to_owned(),
             bulletin_event_hash: None,
             signature: None,
             package_claims: None,
