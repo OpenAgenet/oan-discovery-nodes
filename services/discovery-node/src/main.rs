@@ -6890,15 +6890,12 @@ fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<Resour
         assertion_method: vec![format!("{did}#key-1")],
         capability_invocation: vec![format!("{did}#key-1")],
         service: vec![service.clone()],
-        proof: Some(oan_core::DataIntegrityProof {
+        proof: Some(oan_core::ProfileV2DataIntegrityProof {
             proof_type: "Ed25519Signature2020".to_owned(),
-            creator: format!("{did}#key-1"),
             created: Utc::now(),
             proof_purpose: "assertionMethod".to_owned(),
-            proof_value: "evaluation-fixture".to_owned(),
-            crypto_suite: Some(CryptoSuite::Ed25519Sha256),
-            hash_algorithm: Some("sha256".to_owned()),
-            verification_method: Some(format!("{did}#key-1")),
+            proof_value: "z4HnYnN6MCvEhMhcjUKpVYCaqXyP714jVJXJVTJprdb9wdTGsY5dkRWPf2wXNJuRWA1XiMZFPizD9PGEM3ZV4vNYF".to_owned(),
+            verification_method: format!("{did}#key-1"),
         }),
         oan_metadata: Some(OanMetadata {
             subject_type: match seed.resource_type {
