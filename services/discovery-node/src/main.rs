@@ -19,7 +19,11 @@ use oan_core::{
     CryptoSuite, DidDocument, ImplementationLink, OanMetadata, ProtocolBinding,
     ResourceDescription, ResourceType, ServiceEndpoint, SubjectType, VerificationMethod,
 };
-use oan_crypto::{hash_json_with_suite, sha256_hex, signing_key_from_bytes};
+use oan_crypto::{
+    did_document_signature_input, generate_ed25519_keypair, hash_json_with_suite, public_key_jwk,
+    public_key_multibase, sha256_hex, sign_bytes_multibase, signing_key_from_bytes,
+    verify_did_document_proof, SigningKey, VerifyingKey,
+};
 use oan_package::{
     hash_resource_metadata_with_suite, ResourceMetadata, ResourcePackage, ResourcePackageClaims,
     RootProof,
@@ -1146,6 +1150,8 @@ async fn build_app_state(config: Config) -> Result<AppState> {
     did_doc
         .validate_infrastructure_profile(ResourceType::DiscoveryNode)
         .map_err(|error| anyhow!("invalid discovery DID document profile: {error}"))?;
+    verify_did_document_proof(&did_doc)
+        .map_err(|error| anyhow!("invalid discovery DID document proof: {error}"))?;
     let key: DevKeyFile = JsonStore::new(".").read(config.paths.keys_dir.join("keypair.json"))?;
     let crypto_suite = crypto_suite_from_algorithm(&key.algorithm)?;
     let _signing_key = signing_key_from_bytes(
@@ -6873,30 +6879,38 @@ fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<Resour
         version: Some(seed.package_version.clone()),
         ..Default::default()
     };
-    let did_document = DidDocument {
-        context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+    let key = generate_ed25519_keypair();
+    let signing_key = SigningKey::Ed25519 {
+        suite: CryptoSuite::Ed25519Sha256,
+        key: key.clone(),
+    };
+    let verifying_key = VerifyingKey::Ed25519 {
+        suite: CryptoSuite::Ed25519Sha256,
+        key: key.verifying_key(),
+    };
+    let key_id = format!("{did}#key-1");
+    let mut did_document = DidDocument {
+        context: vec![
+            "https://www.w3.org/ns/did/v1".to_owned(),
+            "https://openagenet.xyz/did-oan-specs/v1".to_owned(),
+            "https://w3id.org/security/suites/ed25519-2020/v1".to_owned(),
+        ],
         id: did.clone(),
         controller: Some(oan_core::DidController::Did(did.clone())),
         verification_method: vec![VerificationMethod {
-            id: format!("{did}#key-1"),
+            id: key_id.clone(),
             method_type: "Ed25519VerificationKey2020".to_owned(),
             controller: did.clone(),
             crypto_suite: Some(CryptoSuite::Ed25519Sha256),
             public_key_format: None,
-            public_key_multibase: Some("zExample".to_owned()),
-            public_key_jwk: None,
+            public_key_multibase: Some(public_key_multibase(&verifying_key)),
+            public_key_jwk: Some(public_key_jwk(&verifying_key)),
         }],
-        authentication: vec![format!("{did}#key-1")],
-        assertion_method: vec![format!("{did}#key-1")],
-        capability_invocation: vec![format!("{did}#key-1")],
+        authentication: vec![key_id.clone()],
+        assertion_method: vec![key_id.clone()],
+        capability_invocation: vec![key_id.clone()],
         service: vec![service.clone()],
-        proof: Some(oan_core::ProfileV2DataIntegrityProof {
-            proof_type: "Ed25519Signature2020".to_owned(),
-            created: Utc::now(),
-            proof_purpose: "assertionMethod".to_owned(),
-            proof_value: "z4HnYnN6MCvEhMhcjUKpVYCaqXyP714jVJXJVTJprdb9wdTGsY5dkRWPf2wXNJuRWA1XiMZFPizD9PGEM3ZV4vNYF".to_owned(),
-            verification_method: format!("{did}#key-1"),
-        }),
+        proof: None,
         oan_metadata: Some(OanMetadata {
             subject_type: match seed.resource_type {
                 ResourceType::AgentService => SubjectType::AgentService,
@@ -6932,6 +6946,17 @@ fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<Resour
             extra: Default::default(),
         }),
     };
+    let proof_input = did_document_signature_input(&did_document, CryptoSuite::Ed25519Sha256)?;
+    did_document.proof = Some(oan_core::DataIntegrityProof {
+        proof_type: "Ed25519Signature2020".to_owned(),
+        creator: String::new(),
+        created: Utc::now(),
+        proof_purpose: "assertionMethod".to_owned(),
+        proof_value: sign_bytes_multibase(&signing_key, &proof_input)?,
+        crypto_suite: None,
+        hash_algorithm: None,
+        verification_method: Some(key_id),
+    });
     let mut package = ResourcePackage {
         package_version: seed.package_version.clone(),
         resource_did: did.clone(),
@@ -7957,6 +7982,8 @@ fn validate_resource_package_for_index(
         .did_document
         .validate_oan_resource()
         .map_err(|err| err.to_string())?;
+    verify_did_document_proof(&package.did_document)
+        .map_err(|_| "did_document_proof_invalid".to_owned())?;
     package
         .verify_did_document_hash()
         .and_then(|_| package.verify_metadata_hash())
