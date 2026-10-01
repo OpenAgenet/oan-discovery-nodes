@@ -14,15 +14,15 @@ use axum::{
 use chrono::{Datelike, Utc};
 use futures::TryStreamExt;
 use jieba_rs::Jieba;
-use oan_credentials::OanIdentity;
 use oan_core::{
     CryptoSuite, DidDocument, ImplementationLink, OanMetadata, ProtocolBinding,
     ResourceDescription, ResourceType, ServiceEndpoint, SubjectType, VerificationMethod,
 };
+use oan_credentials::OanIdentity;
 use oan_crypto::{
     did_document_signature_input, generate_ed25519_keypair, hash_json_with_suite, public_key_jwk,
-    public_key_multibase, sha256_hex, sign_bytes_multibase,
-    verify_did_document_proof, SigningKey, VerifyingKey,
+    public_key_multibase, sha256_hex, sign_bytes_multibase, verify_did_document_proof, SigningKey,
+    VerifyingKey,
 };
 use oan_package::{
     hash_resource_metadata_with_suite, ResourceMetadata, ResourcePackage, ResourcePackageClaims,
@@ -1132,7 +1132,8 @@ async fn main() -> Result<()> {
 async fn build_app_state(config: Config) -> Result<AppState> {
     let identity: OanIdentity = JsonStore::new(".").read(&config.paths.identity_file)?;
     identity
-        .validate()
+        .validate_data_integrity()
+        .await
         .map_err(|err| anyhow!("invalid OAN Identity: {err}"))?;
     let did_doc: DidDocument = identity.did_document.clone();
     #[cfg(not(test))]
