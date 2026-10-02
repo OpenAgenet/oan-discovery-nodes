@@ -22,7 +22,8 @@ use oan_credentials::OanIdentity;
 use oan_crypto::{
     did_document_signature_input, generate_ed25519_keypair, hash_json_with_suite, public_key_jwk,
     public_key_multibase, sha256_hex, sign_bytes_multibase, verify_did_document_proof,
-    verify_did_document_proof_standard_blocking, SigningKey, VerifyingKey,
+    verify_did_document_proof_standard_blocking, verify_did_document_proof_standard_value_blocking,
+    SigningKey, VerifyingKey,
 };
 use oan_package::{
     hash_resource_metadata_with_suite, ResourceMetadata, ResourcePackage, ResourcePackageClaims,
@@ -127,9 +128,15 @@ struct DiscoveryNotificationItem {
 
 #[derive(Clone, Debug)]
 enum PackageFetchOutcome {
-    Found(Box<ResourcePackage>),
+    Found(Box<FetchedResourcePackage>),
     Unavailable(String),
     PermanentFailure(String),
+}
+
+#[derive(Clone, Debug)]
+struct FetchedResourcePackage {
+    package: ResourcePackage,
+    raw_did_document: Option<Value>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -2739,9 +2746,13 @@ async fn sync_resources_from_cdn_items(
         if item.publication_cursor > target_cursor {
             break;
         }
+        if cursor > 0 && item.publication_cursor > cursor + 1 {
+            blocked_cursor.get_or_insert(cursor + 1);
+            break;
+        }
         fetched_count += 1;
         cursor = cursor.max(item.publication_cursor);
-        let package = if let Some(package) = batch_packages.get(&item.resource_did) {
+        let fetched = if let Some(package) = batch_packages.get(&item.resource_did) {
             package.clone()
         } else {
             match fetch_cdn_resource_package_classified(&state, &cdn_base, &item.resource_did).await
@@ -2776,12 +2787,13 @@ async fn sync_resources_from_cdn_items(
                 }
             }
         };
+        let package = &fetched.package;
         if package.resource_did != item.resource_did {
             rejected.push(rejected_package_with_reason(&item, "resource_did_mismatch"));
             blocked_cursor.get_or_insert(item.publication_cursor);
             continue;
         }
-        if let Err(reason) = validate_notified_resource_package(&item, &package) {
+        if let Err(reason) = validate_notified_resource_package(&item, package) {
             rejected.push(rejected_package_with_reason(&item, reason));
             blocked_cursor.get_or_insert(item.publication_cursor);
             continue;
@@ -2791,12 +2803,14 @@ async fn sync_resources_from_cdn_items(
             blocked_cursor.get_or_insert(item.publication_cursor);
             continue;
         }
-        if let Err(reason) = validate_resource_package_for_index(&package) {
+        if let Err(reason) =
+            validate_fetched_resource_package_for_index(package, fetched.raw_did_document.as_ref())
+        {
             rejected.push(rejected_package_with_reason(&item, reason));
             blocked_cursor.get_or_insert(item.publication_cursor);
             continue;
         }
-        accepted.push((item.publication_cursor, package));
+        accepted.push((item.publication_cursor, fetched.package));
     }
 
     let accepted_dids = accepted
@@ -2804,10 +2818,13 @@ async fn sync_resources_from_cdn_items(
         .map(|(_, package)| package.resource_did.as_str())
         .collect::<HashSet<_>>();
     rejected.retain(|item| !accepted_dids.contains(rejected_package_resource_did(item)));
-    blocked_cursor = rejected
-        .iter()
-        .filter_map(|item| item.get("cursor").and_then(Value::as_i64))
-        .min();
+    if !rejected.is_empty() {
+        blocked_cursor = rejected
+            .iter()
+            .filter_map(|item| item.get("cursor").and_then(Value::as_i64))
+            .min()
+            .or(blocked_cursor);
+    }
 
     let synced = accepted.len();
     upsert_indexed_resource_packages_batch(&state, &accepted)
@@ -2863,7 +2880,7 @@ async fn fetch_cdn_resource_packages_batch(
     state: &AppState,
     cdn_base: &str,
     items: &[DiscoveryNotificationItem],
-) -> Result<BTreeMap<String, ResourcePackage>> {
+) -> Result<BTreeMap<String, FetchedResourcePackage>> {
     if items.is_empty() {
         return Ok(BTreeMap::new());
     }
@@ -2895,7 +2912,17 @@ async fn fetch_cdn_resource_packages_batch(
             continue;
         };
         let package = serde_json::from_value::<ResourcePackage>(package_value.clone())?;
-        packages.insert(resource_did.to_owned(), package);
+        let raw_did_document = package
+            .did_document_raw
+            .clone()
+            .or_else(|| package_value.get("didDocument").cloned());
+        packages.insert(
+            resource_did.to_owned(),
+            FetchedResourcePackage {
+                package,
+                raw_did_document,
+            },
+        );
     }
     Ok(packages)
 }
@@ -2940,8 +2967,24 @@ async fn fetch_cdn_resource_package_classified(
             status.as_u16()
         )));
     }
-    match response.json::<ResourcePackage>().await {
-        Ok(package) => Ok(PackageFetchOutcome::Found(Box::new(package))),
+    let value = match response.json::<Value>().await {
+        Ok(value) => value,
+        Err(err) => {
+            return Ok(PackageFetchOutcome::PermanentFailure(format!(
+                "cdn_decode_failed:{err}"
+            )))
+        }
+    };
+    match serde_json::from_value::<ResourcePackage>(value) {
+        Ok(package) => {
+            let raw_did_document = package.did_document_raw.clone();
+            Ok(PackageFetchOutcome::Found(Box::new(
+                FetchedResourcePackage {
+                    package,
+                    raw_did_document,
+                },
+            )))
+        }
         Err(err) => Ok(PackageFetchOutcome::PermanentFailure(format!(
             "cdn_decode_failed:{err}"
         ))),
@@ -4295,8 +4338,9 @@ async fn recover_rejected_package_once(
         ));
     }
     match fetch_cdn_resource_package_classified(state, cdn_base, &resource_did).await? {
-        PackageFetchOutcome::Found(package) => {
-            let package = *package;
+        PackageFetchOutcome::Found(fetched) => {
+            let fetched = *fetched;
+            let package = fetched.package;
             let discovery_domains = local_discovery_authorized_domains(state)?;
             let reject_reason = if package.resource_did != resource_did {
                 Some("resource_did_mismatch".to_owned())
@@ -4309,7 +4353,11 @@ async fn recover_rejected_package_once(
             ) {
                 Some("unauthorized_domains".to_owned())
             } else {
-                validate_resource_package_for_index(&package).err()
+                validate_fetched_resource_package_for_index(
+                    &package,
+                    fetched.raw_did_document.as_ref(),
+                )
+                .err()
             };
             if let Some(reason) = reject_reason {
                 let replacement =
@@ -6954,6 +7002,7 @@ fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<Resour
         resource_did: did.clone(),
         resource_type: seed.resource_type.clone(),
         did_document,
+        did_document_raw: None,
         did_document_hash: String::new(),
         metadata_hash: String::new(),
         package_hash: String::new(),
@@ -7970,11 +8019,22 @@ async fn rejected_package_retry_summary_from_store(state: &AppState) -> Result<V
 fn validate_resource_package_for_index(
     package: &ResourcePackage,
 ) -> std::result::Result<(), String> {
+    validate_fetched_resource_package_for_index(package, None)
+}
+
+fn validate_fetched_resource_package_for_index(
+    package: &ResourcePackage,
+    raw_did_document: Option<&Value>,
+) -> std::result::Result<(), String> {
     package
         .did_document
         .validate_oan_resource()
         .map_err(|err| err.to_string())?;
-    if verify_did_document_proof_standard_blocking(&package.did_document).is_err() {
+    let standard_result = raw_did_document
+        .cloned()
+        .map(verify_did_document_proof_standard_value_blocking)
+        .unwrap_or_else(|| verify_did_document_proof_standard_blocking(&package.did_document));
+    if standard_result.is_err() {
         verify_did_document_proof(&package.did_document)
             .map_err(|_| "did_document_proof_invalid".to_owned())?;
     }
