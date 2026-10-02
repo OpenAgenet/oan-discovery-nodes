@@ -989,8 +989,15 @@ fn semantic_rebuild_skip_prefix(stage: Option<SemanticRebuildStage>) -> String {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()?
+        .block_on(async { tokio::spawn(async_main()).await? })
+}
+
+async fn async_main() -> Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args
         .first()
@@ -6932,8 +6939,9 @@ fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<Resour
     };
     let proof_input = did_document_signature_input(&did_document, CryptoSuite::Ed25519Sha256)?;
     did_document.proof = Some(oan_core::DataIntegrityProof {
+        context: None,
         proof_type: "Ed25519Signature2020".to_owned(),
-        creator: String::new(),
+        creator: key_id.clone(),
         created: Utc::now(),
         proof_purpose: "assertionMethod".to_owned(),
         proof_value: sign_bytes_multibase(&signing_key, &proof_input)?,
