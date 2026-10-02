@@ -20,8 +20,8 @@ use oan_core::{
 };
 use oan_credentials::OanIdentity;
 use oan_crypto::{
-    did_document_signature_input, generate_ed25519_keypair, hash_json_with_suite, public_key_jwk,
-    public_key_multibase, sha256_hex, sign_bytes_multibase, verify_did_document_proof,
+    generate_ed25519_keypair, hash_json_with_suite, private_key_jwk, public_key_jwk,
+    public_key_multibase, sha256_hex, sign_oan_data_integrity, verify_did_document_proof,
     verify_did_document_proof_standard_blocking, verify_did_document_proof_standard_value_blocking,
     SigningKey, VerifyingKey,
 };
@@ -6919,10 +6919,6 @@ fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<Resour
         ..Default::default()
     };
     let key = generate_ed25519_keypair();
-    let signing_key = SigningKey::Ed25519 {
-        suite: CryptoSuite::Ed25519Sha256,
-        key: key.clone(),
-    };
     let verifying_key = VerifyingKey::Ed25519 {
         suite: CryptoSuite::Ed25519Sha256,
         key: key.verifying_key(),
@@ -6985,18 +6981,7 @@ fn seed_resource_package(seed: &SemanticEvaluationSeedResource) -> Result<Resour
             extra: Default::default(),
         }),
     };
-    let proof_input = did_document_signature_input(&did_document, CryptoSuite::Ed25519Sha256)?;
-    did_document.proof = Some(oan_core::DataIntegrityProof {
-        context: None,
-        proof_type: "Ed25519Signature2020".to_owned(),
-        creator: key_id.clone(),
-        created: Utc::now(),
-        proof_purpose: "assertionMethod".to_owned(),
-        proof_value: sign_bytes_multibase(&signing_key, &proof_input)?,
-        crypto_suite: None,
-        hash_algorithm: None,
-        verification_method: Some(key_id),
-    });
+    did_document = sign_did_document_with_key(&did_document, key)?;
     let mut package = ResourcePackage {
         package_version: seed.package_version.clone(),
         resource_did: did.clone(),
@@ -7083,6 +7068,47 @@ fn refresh_resource_package_hashes(package: &mut ResourcePackage) -> Result<()> 
         bulletin_ref: None,
     })?);
     Ok(())
+}
+
+fn sign_did_document_with_key(
+    document: &DidDocument,
+    key: ed25519_dalek::SigningKey,
+) -> Result<DidDocument> {
+    for _ in 0..10 {
+        let mut unsigned = document.clone();
+        unsigned.proof = None;
+        let did = unsigned.id.clone();
+        let signing_key = SigningKey::Ed25519 {
+            suite: CryptoSuite::Ed25519Sha256,
+            key: key.clone(),
+        };
+        let private_jwk = private_key_jwk(&signing_key);
+        let signed = std::thread::Builder::new()
+            .name("discovery-did-signer".to_owned())
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(sign_oan_data_integrity(
+                        serde_json::to_value(&unsigned).unwrap(),
+                        &did,
+                        private_jwk,
+                    ))
+            })?
+            .join()
+            .map_err(|_| anyhow!("DID document signing thread panicked"))??;
+        let signed_document: DidDocument = serde_json::from_value(signed)?;
+        if verify_did_document_proof_standard_value_blocking(serde_json::to_value(
+            &signed_document,
+        )?)
+        .is_ok()
+        {
+            return Ok(signed_document);
+        }
+    }
+    Err(anyhow!("signed DID document proof is invalid"))
 }
 
 fn read_utf8_text_allowing_bom(path: &Path) -> Result<String> {
