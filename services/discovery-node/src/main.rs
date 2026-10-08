@@ -2746,10 +2746,6 @@ async fn sync_resources_from_cdn_items(
         if item.publication_cursor > target_cursor {
             break;
         }
-        if cursor > 0 && item.publication_cursor > cursor + 1 {
-            blocked_cursor.get_or_insert(cursor + 1);
-            break;
-        }
         fetched_count += 1;
         cursor = cursor.max(item.publication_cursor);
         let fetched = if let Some(package) = batch_packages.get(&item.resource_did) {
