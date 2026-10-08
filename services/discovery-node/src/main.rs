@@ -2799,8 +2799,6 @@ async fn sync_resources_from_cdn_items(
             continue;
         }
         if !authorized_domains_cover(&discovery_domains, &package.metadata.authorized_domains) {
-            rejected.push(rejected_package_with_reason(&item, "unauthorized_domains"));
-            blocked_cursor.get_or_insert(item.publication_cursor);
             continue;
         }
         if let Err(reason) =
