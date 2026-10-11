@@ -14,6 +14,39 @@ export type EmbeddingExtractor = (
   options: Record<string, unknown>,
 ) => Promise<unknown>;
 
+export function splitModelBatches(
+  input: string[],
+  maxBatchSize: number,
+  maxBatchInputChars: number,
+): string[][] {
+  const batches: string[][] = [];
+  const safeBatchSize = Math.max(1, maxBatchSize);
+  const safeMaxBatchInputChars = Math.max(1, maxBatchInputChars);
+  let batch: string[] = [];
+  let longestInputChars = 0;
+
+  for (const text of input) {
+    const inputChars = Array.from(text).length;
+    if (
+      batch.length > 0 &&
+      (batch.length >= safeBatchSize ||
+        Math.max(longestInputChars, inputChars) > safeMaxBatchInputChars)
+    ) {
+      batches.push(batch);
+      batch = [];
+      longestInputChars = 0;
+    }
+
+    batch.push(text);
+    longestInputChars = Math.max(longestInputChars, inputChars);
+  }
+
+  if (batch.length > 0) {
+    batches.push(batch);
+  }
+  return batches;
+}
+
 export class DeterministicEmbeddingProvider implements EmbeddingProvider {
   readonly model: string;
   readonly embeddingVersion: string;
@@ -38,6 +71,7 @@ export class TransformersEmbeddingProvider implements EmbeddingProvider {
   readonly dtype: string;
   readonly dimension: number;
   private extractorPromise?: Promise<EmbeddingExtractor>;
+  private inferenceTail: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly config: EmbeddingServiceConfig,
@@ -55,10 +89,26 @@ export class TransformersEmbeddingProvider implements EmbeddingProvider {
       return [];
     }
     const extractor = await this.loadExtractor();
-    const output = await extractor(input, { pooling: "mean", normalize: true });
-    return tensorToVectors(output, input.length, this.dimension).map((vector) => {
-      validateVector(vector, this.dimension);
-      return normalizeVector(vector);
+    return this.runInference(async () => {
+      const vectors: number[][] = [];
+      for (const batch of splitModelBatches(
+        input,
+        this.config.modelBatchSize,
+        this.config.modelBatchMaxInputChars,
+      )) {
+        const output = await extractor(batch, { pooling: "mean", normalize: true });
+        try {
+          vectors.push(
+            ...tensorToVectors(output, batch.length, this.dimension).map((vector) => {
+              validateVector(vector, this.dimension);
+              return normalizeVector(vector);
+            }),
+          );
+        } finally {
+          await disposeEmbeddingOutput(output);
+        }
+      }
+      return vectors;
     });
   }
 
@@ -67,6 +117,31 @@ export class TransformersEmbeddingProvider implements EmbeddingProvider {
       this.extractorPromise = this.extractorLoader();
     }
     return this.extractorPromise;
+  }
+
+  private async runInference<T>(operation: () => Promise<T>): Promise<T> {
+    const previous = this.inferenceTail;
+    let release!: () => void;
+    this.inferenceTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
+  }
+}
+
+async function disposeEmbeddingOutput(output: unknown): Promise<void> {
+  if (
+    output &&
+    typeof output === "object" &&
+    "dispose" in output &&
+    typeof output.dispose === "function"
+  ) {
+    await output.dispose();
   }
 }
 

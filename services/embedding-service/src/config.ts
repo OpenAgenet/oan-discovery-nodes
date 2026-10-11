@@ -10,6 +10,8 @@ export interface EmbeddingServiceConfig {
   dimension: number;
   maxInputChars: number;
   batchSize: number;
+  modelBatchSize: number;
+  modelBatchMaxInputChars: number;
   dtype: string;
   cacheDir?: string;
   localModelPath?: string;
@@ -61,6 +63,11 @@ export function loadConfig(): EmbeddingServiceConfig {
     ),
     maxInputChars: intFromEnv("OAN_EMBEDDING_MAX_INPUT_CHARS", 6000),
     batchSize: intFromEnv("OAN_EMBEDDING_BATCH_SIZE", 8),
+    modelBatchSize: intFromEnv("OAN_EMBEDDING_MODEL_BATCH_SIZE", 2),
+    modelBatchMaxInputChars: intFromEnv(
+      "OAN_EMBEDDING_MODEL_BATCH_MAX_INPUT_CHARS",
+      2000,
+    ),
     dtype: process.env.OAN_EMBEDDING_DTYPE ?? "q8",
     cacheDir: process.env.OAN_EMBEDDING_CACHE_DIR,
     localModelPath: process.env.OAN_EMBEDDING_LOCAL_MODEL_PATH,

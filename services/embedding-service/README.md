@@ -73,6 +73,9 @@ $env:OAN_EMBEDDING_LOCAL_MODEL_PATH="D:\Works\VscodeProject\OAN\models\onnx-comm
 $env:OAN_EMBEDDING_VERSION="gte-multilingual-base-q8-local"
 $env:OAN_EMBEDDING_DIMENSION="768"
 $env:OAN_EMBEDDING_DTYPE="q8"
+$env:OAN_EMBEDDING_BATCH_SIZE="8"
+$env:OAN_EMBEDDING_MODEL_BATCH_SIZE="2"
+$env:OAN_EMBEDDING_MODEL_BATCH_MAX_INPUT_CHARS="2000"
 npm run dev
 ```
 
@@ -84,6 +87,13 @@ to build the Discovery semantic index.
 `OAN_EMBEDDING_MODEL` is the model name exposed to Discovery Node. It should
 match `semanticSearch.embedding.modelName`. `OAN_EMBEDDING_MODEL_ID` is the
 Transformers.js model identifier or local model selector used by this service.
+`OAN_EMBEDDING_BATCH_SIZE` limits one HTTP request. It is intentionally
+independent from `OAN_EMBEDDING_MODEL_BATCH_SIZE`, which limits one model
+inference call. A model batch is also split when its longest input exceeds
+`OAN_EMBEDDING_MODEL_BATCH_MAX_INPUT_CHARS`, preventing one long resource from
+inflating the memory use of the whole batch. The production-safe defaults are
+an HTTP batch of 8, a model batch of 2, and a model-batch length bound of 2000
+characters.
 
 The real model smoke test is opt-in:
 

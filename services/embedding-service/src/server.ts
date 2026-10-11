@@ -28,6 +28,9 @@ export function createEmbeddingServer(config: EmbeddingServiceConfig) {
           embeddingVersion: provider.embeddingVersion,
           dtype: provider.dtype,
           dimension: provider.dimension,
+          batchSize: config.batchSize,
+          modelBatchSize: config.modelBatchSize,
+          modelBatchMaxInputChars: config.modelBatchMaxInputChars,
           ready: true,
         });
         return;
