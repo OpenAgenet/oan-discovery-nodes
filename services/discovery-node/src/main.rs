@@ -39,7 +39,6 @@ use oan_storage::{DatabaseBackend, DatabaseConfig, JsonStore, PostgresJsonStore,
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sqlx::{Postgres, QueryBuilder, Row, Sqlite};
-#[cfg(not(test))]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
@@ -50,7 +49,7 @@ use std::{
     sync::{Arc, OnceLock},
     time::{Duration as StdDuration, Instant},
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use tokio::time::{sleep, Duration as TokioDuration};
 use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 
@@ -78,6 +77,12 @@ const DISCOVERY_INDEX_PACKAGE_BYTES: usize = 8 * 1024 * 1024;
 const DISCOVERY_INDEX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 #[cfg(not(test))]
 const LATE_PACKAGE_IDLE_STOP_CYCLES: u64 = 5;
+
+#[derive(Clone, Copy, Debug, Default)]
+struct SemanticCompensationOutcome {
+    processed: usize,
+    failed: usize,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LatePackageRetryExit {
@@ -493,6 +498,8 @@ struct AppState {
     recommender: Arc<SemanticRecommender>,
     client: reqwest::Client,
     resource_sync_lock: Arc<Mutex<()>>,
+    semantic_index_running: Arc<AtomicBool>,
+    semantic_index_notify: Arc<Notify>,
     #[cfg(not(test))]
     late_package_retry_running: Arc<AtomicBool>,
     index_stats_cache: Arc<Mutex<Option<CachedIndexStats>>>,
@@ -1202,6 +1209,8 @@ async fn build_app_state(config: Config) -> Result<AppState> {
         recommender: Arc::new(SemanticRecommender::new()?),
         client: reqwest::Client::new(),
         resource_sync_lock: Arc::new(Mutex::new(())),
+        semantic_index_running: Arc::new(AtomicBool::new(false)),
+        semantic_index_notify: Arc::new(Notify::new()),
         #[cfg(not(test))]
         late_package_retry_running: Arc::new(AtomicBool::new(false)),
         index_stats_cache: Arc::new(Mutex::new(None)),
@@ -3539,6 +3548,7 @@ async fn api_status(State(state): State<AppState>) -> ApiResult<Value> {
         .await
         .map_err(ApiError::internal)?;
     let bulletin = fetch_bulletin(&state).await.ok();
+    let semantic_indexing = semantic_indexing_status_json(&state).await;
     Ok(Json(json!({
         "discoveryDid": state.did,
         "rootEndpoint": state.config.upstream.root_endpoint,
@@ -3546,7 +3556,8 @@ async fn api_status(State(state): State<AppState>) -> ApiResult<Value> {
         "indexedResourceCount": indexed_resource_count,
         "lastSync": last_sync,
         "rootAuthorizationStatus": bulletin.as_ref().map(|b| discovery_authorization_status(b, &state.did)).unwrap_or_else(|| "unknown".to_owned()),
-        "semanticSearch": semantic_status_json(&state, false, None)
+        "semanticSearch": semantic_status_json(&state, false, None),
+        "semanticIndexing": semantic_indexing
     })))
 }
 
@@ -3683,6 +3694,10 @@ async fn discovery_index_stats_body(state: &AppState) -> Result<Value> {
                 Ok(None) => Value::Null,
                 Err(err) => json!({ "error": err.to_string() }),
             },
+        );
+        map.insert(
+            "semanticIndexing".to_owned(),
+            semantic_indexing_status_json(state).await,
         );
     }
     if let Ok(mut cache) = state.index_stats_cache.try_lock() {
@@ -4739,17 +4754,7 @@ async fn upsert_indexed_resource_packages_batch_with_cleanup(
         if cleanup_rejected_by_did {
             delete_rejected_packages_by_did(state, &accepted_dids).await?;
         }
-        if semantic_search_available(state) {
-            if let Err(err) = upsert_semantic_index_batch_with_retries(
-                state,
-                &projected,
-                SemanticRebuildStage::Both,
-            )
-            .await
-            {
-                eprintln!("semantic index upsert failed: {err}");
-            }
-        }
+        wake_semantic_index_worker(state);
         return Ok(());
     }
     let mut indexed = read_indexed_resource_packages(state).await?;
@@ -4849,25 +4854,50 @@ async fn upsert_semantic_index_batch_with_retries(
 }
 
 async fn semantic_index_compensation_loop(state: AppState) {
-    sleep(TokioDuration::from_secs(60)).await;
     loop {
-        if let Err(err) = compensate_semantic_indexes(&state).await {
-            eprintln!("semantic index compensation failed: {err}");
+        match compensate_semantic_indexes(&state).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(err) => eprintln!("semantic index compensation failed: {err}"),
         }
-        sleep(TokioDuration::from_secs(300)).await;
+        tokio::select! {
+            _ = state.semantic_index_notify.notified() => {}
+            _ = sleep(TokioDuration::from_secs(300)) => {}
+        }
     }
 }
 
-async fn compensate_semantic_indexes(state: &AppState) -> Result<()> {
-    if state.postgres.is_none() || !semantic_search_available(state) {
-        return Ok(());
+fn wake_semantic_index_worker(state: &AppState) {
+    if state.postgres.is_some() && semantic_search_available(state) {
+        state.semantic_index_notify.notify_one();
     }
-    let _sync_guard = state.resource_sync_lock.lock().await;
+}
+
+async fn compensate_semantic_indexes(state: &AppState) -> Result<bool> {
+    if state.postgres.is_none() || !semantic_search_available(state) {
+        return Ok(false);
+    }
+    if state
+        .semantic_index_running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Ok(false);
+    }
+    let result = compensate_semantic_indexes_once(state).await;
+    state.semantic_index_running.store(false, Ordering::SeqCst);
+    result.map(|outcome| {
+        outcome.processed >= DISCOVERY_SEMANTIC_REBUILD_PAGE_SIZE as usize && outcome.failed == 0
+    })
+}
+
+async fn compensate_semantic_indexes_once(state: &AppState) -> Result<SemanticCompensationOutcome> {
     backfill_skipped_semantic_indexes(state, SemanticRebuildStage::Both).await?;
     let pending = read_semantic_index_pending_packages(state, 100).await?;
     if pending.is_empty() {
-        return Ok(());
+        return Ok(SemanticCompensationOutcome::default());
     }
+    let processed = pending.len();
     let projected = pending
         .iter()
         .map(|(cursor, package)| DiscoveryProjectedPackage {
@@ -4877,7 +4907,11 @@ async fn compensate_semantic_indexes(state: &AppState) -> Result<()> {
             projection: discovery_package_projection(package),
         })
         .collect::<Vec<_>>();
-    upsert_semantic_index_batch_with_retries(state, &projected, SemanticRebuildStage::Both).await
+    upsert_semantic_index_batch_with_retries(state, &projected, SemanticRebuildStage::Both).await?;
+    let failed = load_semantic_rebuild_skip_records(state, Some(SemanticRebuildStage::Both))
+        .await?
+        .len();
+    Ok(SemanticCompensationOutcome { processed, failed })
 }
 
 async fn upsert_pgvector_semantic_index_batch(
@@ -5136,6 +5170,88 @@ async fn count_intent_indexed_rows(state: &AppState) -> Result<Option<i64>> {
     .fetch_one(postgres.pool())
     .await?;
     Ok(Some(row.get::<i64, _>(0)))
+}
+
+async fn count_semantic_pending_resources(state: &AppState) -> Result<Option<i64>> {
+    let Some(postgres) = &state.postgres else {
+        return Ok(None);
+    };
+    if !state.semantic.enabled {
+        return Ok(None);
+    }
+    let row = sqlx::query(&format!(
+        r#"
+        SELECT COUNT(*)
+        FROM {DISCOVERY_PACKAGE_TABLE} p
+        LEFT JOIN {DISCOVERY_SEMANTIC_INDEX_TABLE} s
+          ON p.resource_did = s.resource_did
+         AND s.embedding_model = $1
+         AND s.embedding_version = $2
+        WHERE p.lifecycle_state = 'active'
+          AND p.resource_type = ANY($3)
+          AND (s.resource_did IS NULL OR p.updated_at > s.updated_at)
+        "#
+    ))
+    .bind(&state.semantic.embedding_model)
+    .bind(&state.semantic.embedding_version)
+    .bind(default_discoverable_resource_type_names())
+    .fetch_one(postgres.pool())
+    .await?;
+    Ok(Some(row.get::<i64, _>(0)))
+}
+
+async fn count_semantic_failed_resources(state: &AppState) -> Result<Option<i64>> {
+    if !state.semantic.enabled {
+        return Ok(None);
+    }
+    Ok(Some(
+        load_semantic_rebuild_skip_records(state, Some(SemanticRebuildStage::Both))
+            .await?
+            .len() as i64,
+    ))
+}
+
+async fn semantic_indexing_status_json(state: &AppState) -> Value {
+    let pending_count = count_semantic_pending_resources(state).await;
+    let failed_count = count_semantic_failed_resources(state).await;
+    let lag_may_exist = pending_count
+        .as_ref()
+        .ok()
+        .and_then(|count| *count)
+        .unwrap_or_default()
+        > 0
+        || failed_count
+            .as_ref()
+            .ok()
+            .and_then(|count| *count)
+            .unwrap_or_default()
+            > 0;
+    json!({
+        "enabled": semantic_search_available(state),
+        "workerRunning": state.semantic_index_running.load(Ordering::SeqCst),
+        "semanticIndexedResourceCount": match count_semantic_indexed_resources(state).await {
+            Ok(Some(count)) => json!(count),
+            Ok(None) => Value::Null,
+            Err(err) => json!({ "error": err.to_string() }),
+        },
+        "semanticIntentIndexedRowCount": match count_intent_indexed_rows(state).await {
+            Ok(Some(count)) => json!(count),
+            Ok(None) => Value::Null,
+            Err(err) => json!({ "error": err.to_string() }),
+        },
+        "semanticPendingCount": match pending_count {
+            Ok(Some(count)) => json!(count),
+            Ok(None) => Value::Null,
+            Err(err) => json!({ "error": err.to_string() }),
+        },
+        "semanticFailedCount": match failed_count {
+            Ok(Some(count)) => json!(count),
+            Ok(None) => Value::Null,
+            Err(err) => json!({ "error": err.to_string() }),
+        },
+        "semanticLagMayExist": lag_may_exist,
+        "embeddingRequestBatchSize": state.config.semantic_search.embedding.batch_size,
+    })
 }
 
 async fn read_semantic_index_pending_packages(
