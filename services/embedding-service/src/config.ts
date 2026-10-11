@@ -60,7 +60,7 @@ export function loadConfig(): EmbeddingServiceConfig {
       provider === "transformers" ? 768 : 64,
     ),
     maxInputChars: intFromEnv("OAN_EMBEDDING_MAX_INPUT_CHARS", 6000),
-    batchSize: intFromEnv("OAN_EMBEDDING_BATCH_SIZE", 16),
+    batchSize: intFromEnv("OAN_EMBEDDING_BATCH_SIZE", 8),
     dtype: process.env.OAN_EMBEDDING_DTYPE ?? "q8",
     cacheDir: process.env.OAN_EMBEDDING_CACHE_DIR,
     localModelPath: process.env.OAN_EMBEDDING_LOCAL_MODEL_PATH,

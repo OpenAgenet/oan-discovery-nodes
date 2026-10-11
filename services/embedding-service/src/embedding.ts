@@ -9,6 +9,11 @@ export interface EmbeddingProvider {
   embed(input: string[]): Promise<number[][]>;
 }
 
+export type EmbeddingExtractor = (
+  input: string | string[],
+  options: Record<string, unknown>,
+) => Promise<unknown>;
+
 export class DeterministicEmbeddingProvider implements EmbeddingProvider {
   readonly model: string;
   readonly embeddingVersion: string;
@@ -32,9 +37,13 @@ export class TransformersEmbeddingProvider implements EmbeddingProvider {
   readonly embeddingVersion: string;
   readonly dtype: string;
   readonly dimension: number;
-  private extractorPromise?: Promise<(text: string, options: Record<string, unknown>) => Promise<unknown>>;
+  private extractorPromise?: Promise<EmbeddingExtractor>;
 
-  constructor(private readonly config: EmbeddingServiceConfig) {
+  constructor(
+    private readonly config: EmbeddingServiceConfig,
+    private readonly extractorLoader: () => Promise<EmbeddingExtractor> = () =>
+      loadTransformersExtractor(config),
+  ) {
     this.model = config.model;
     this.embeddingVersion = config.embeddingVersion;
     this.dtype = config.dtype;
@@ -42,20 +51,20 @@ export class TransformersEmbeddingProvider implements EmbeddingProvider {
   }
 
   async embed(input: string[]): Promise<number[][]> {
-    const extractor = await this.loadExtractor();
-    const vectors: number[][] = [];
-    for (const text of input) {
-      const output = await extractor(text, { pooling: "mean", normalize: true });
-      const vector = tensorToVector(output);
-      validateVector(vector, this.dimension);
-      vectors.push(normalizeVector(vector));
+    if (input.length === 0) {
+      return [];
     }
-    return vectors;
+    const extractor = await this.loadExtractor();
+    const output = await extractor(input, { pooling: "mean", normalize: true });
+    return tensorToVectors(output, input.length, this.dimension).map((vector) => {
+      validateVector(vector, this.dimension);
+      return normalizeVector(vector);
+    });
   }
 
-  private loadExtractor(): Promise<(text: string, options: Record<string, unknown>) => Promise<unknown>> {
+  private loadExtractor(): Promise<EmbeddingExtractor> {
     if (!this.extractorPromise) {
-      this.extractorPromise = loadTransformersExtractor(this.config);
+      this.extractorPromise = this.extractorLoader();
     }
     return this.extractorPromise;
   }
@@ -63,7 +72,7 @@ export class TransformersEmbeddingProvider implements EmbeddingProvider {
 
 async function loadTransformersExtractor(
   config: EmbeddingServiceConfig,
-): Promise<(text: string, options: Record<string, unknown>) => Promise<unknown>> {
+): Promise<EmbeddingExtractor> {
   const moduleName = "@huggingface/transformers";
   const transformers = (await import(moduleName)) as {
     env?: {
@@ -75,7 +84,7 @@ async function loadTransformersExtractor(
       task: string,
       model: string,
       options?: Record<string, unknown>,
-    ) => Promise<(text: string, options: Record<string, unknown>) => Promise<unknown>>;
+    ) => Promise<EmbeddingExtractor>;
   };
 
   if (config.cacheDir && transformers.env) {
@@ -91,9 +100,34 @@ async function loadTransformersExtractor(
   });
 }
 
-function tensorToVector(output: unknown): number[] {
+export function tensorToVectors(
+  output: unknown,
+  expectedCount: number,
+  dimension: number,
+): number[][] {
+  if (expectedCount <= 0) {
+    return [];
+  }
+  const rows = rowsFromTensorOutput(output, expectedCount, dimension);
+  if (rows.length !== expectedCount || rows.some((row) => row.length !== dimension)) {
+    throw new Error("embedding_output_shape_mismatch");
+  }
+  return rows;
+}
+
+function rowsFromTensorOutput(
+  output: unknown,
+  expectedCount: number,
+  dimension: number,
+): number[][] {
   if (Array.isArray(output)) {
-    return flattenNumericArray(output);
+    if (expectedCount === 1 && output.every((value) => typeof value === "number")) {
+      return [output.map(Number)];
+    }
+    if (output.every((value) => Array.isArray(value))) {
+      return output.map((value) => flattenNumericArray(value));
+    }
+    throw new Error("unsupported_transformers_embedding_output");
   }
   if (output && typeof output === "object") {
     const candidate = output as {
@@ -102,10 +136,21 @@ function tensorToVector(output: unknown): number[] {
       tolist?: () => unknown;
     };
     if (typeof candidate.tolist === "function") {
-      return flattenNumericArray(candidate.tolist());
+      return rowsFromTensorOutput(candidate.tolist(), expectedCount, dimension);
     }
     if (candidate.data) {
-      return Array.from(candidate.data, Number);
+      const data = Array.from(candidate.data, Number);
+      const dims = candidate.dims ?? [];
+      if (
+        data.length !== expectedCount * dimension ||
+        (dims.length > 0 &&
+          (dims.length !== 2 || dims[0] !== expectedCount || dims[1] !== dimension))
+      ) {
+        throw new Error("embedding_output_shape_mismatch");
+      }
+      return Array.from({ length: expectedCount }, (_, index) =>
+        data.slice(index * dimension, (index + 1) * dimension),
+      );
     }
   }
   throw new Error("unsupported_transformers_embedding_output");
