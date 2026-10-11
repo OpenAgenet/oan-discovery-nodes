@@ -5179,7 +5179,7 @@ async fn count_semantic_pending_resources(state: &AppState) -> Result<Option<i64
     if !state.semantic.enabled {
         return Ok(None);
     }
-    let row = sqlx::query(&format!(
+    let missing_row = sqlx::query(&format!(
         r#"
         SELECT COUNT(*)
         FROM {DISCOVERY_PACKAGE_TABLE} p
@@ -5189,7 +5189,7 @@ async fn count_semantic_pending_resources(state: &AppState) -> Result<Option<i64
          AND s.embedding_version = $2
         WHERE p.lifecycle_state = 'active'
           AND p.resource_type = ANY($3)
-          AND (s.resource_did IS NULL OR p.updated_at > s.updated_at)
+          AND s.resource_did IS NULL
         "#
     ))
     .bind(&state.semantic.embedding_model)
@@ -5197,7 +5197,36 @@ async fn count_semantic_pending_resources(state: &AppState) -> Result<Option<i64
     .bind(default_discoverable_resource_type_names())
     .fetch_one(postgres.pool())
     .await?;
-    Ok(Some(row.get::<i64, _>(0)))
+    let mut pending = missing_row.get::<i64, _>(0);
+
+    let rows = sqlx::query(&format!(
+        r#"
+        SELECT p.package_json::text, s.semantic_source_hash
+        FROM {DISCOVERY_PACKAGE_TABLE} p
+        JOIN {DISCOVERY_SEMANTIC_INDEX_TABLE} s
+          ON p.resource_did = s.resource_did
+         AND s.embedding_model = $1
+         AND s.embedding_version = $2
+        WHERE p.lifecycle_state = 'active'
+          AND p.resource_type = ANY($3)
+          AND p.updated_at > s.updated_at
+        "#
+    ))
+    .bind(&state.semantic.embedding_model)
+    .bind(&state.semantic.embedding_version)
+    .bind(default_discoverable_resource_type_names())
+    .fetch_all(postgres.pool())
+    .await?;
+    for row in rows {
+        let package = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(0))?;
+        let projection = discovery_package_projection(&package);
+        let doc = search_document_from_package(0, &package, &projection);
+        let indexed_hash = row.get::<Option<String>, _>(1);
+        if indexed_hash.as_deref() != Some(doc.semantic_source_hash.as_str()) {
+            pending += 1;
+        }
+    }
+    Ok(Some(pending))
 }
 
 async fn count_semantic_failed_resources(state: &AppState) -> Result<Option<i64>> {
