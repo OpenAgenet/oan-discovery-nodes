@@ -5308,6 +5308,7 @@ async fn read_semantic_index_pending_packages(
             WHERE p.cursor > $3
               AND p.lifecycle_state = 'active'
               AND p.resource_type = ANY($4)
+              AND (s.resource_did IS NULL OR p.updated_at > s.updated_at)
             ORDER BY p.cursor, p.resource_did
             LIMIT $5
             "#
